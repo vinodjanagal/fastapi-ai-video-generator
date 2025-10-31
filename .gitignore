@@ -1,0 +1,46 @@
+# Python Environments & Cache
+__pycache__/
+*.pyc
+.env
+.venv
+rev/
+rev2/
+rev3/
+env/
+venv/
+
+# Build artifacts
+app.egg-info/
+build/
+dist/
+
+# IDE and Editor Files
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# SQL and Session Files
+*.sql
+
+# Jupyter Notebooks
+*.ipynb
+
+# Log files
+*.log
+
+# Generated media, models, and large resource files
+static/videos/
+static/audio/
+*.mp3
+*.mp4
+*.wav
+anim_test_frames/
+pretrained_models/
+resources/
+
+# Ignore contents of static/ but keep the directory
+static/*
+!static/.gitkeep
