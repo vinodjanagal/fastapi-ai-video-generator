@@ -74,8 +74,7 @@ class AudioCreateResponse(BaseModel):
 class VideoGenerateRequest(BaseModel):
     quote_id: int = Field(..., gt=0, description="The ID of the quote to generate a video for.")
     style: Optional[str] = Field(default="dark_gradient", description="e.g., 'dark_gradient', 'yellow_punch', 'blue_calm'")
-    background_type: Optional[str] = Field(default="gradient", description="'gradient', 'image_url', or 'video_id'")
-    background_value: Optional[str] = Field(default=None, description="Color hex codes, image URL, or video filename")
+
 
 # --- KEPT FOR REFERENCE ---
 # This schema was used for your old synchronous endpoint. We won't use it for the new

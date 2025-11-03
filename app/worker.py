@@ -1,6 +1,7 @@
 import asyncio
 import subprocess
 import logging
+from app.tasks import process_video_generation_speecht5, process_video_generation
 
 # Set up basic logging to see the output from the worker
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -44,10 +45,54 @@ async def generate_audio_task(ctx, quote_text: str, audio_file_path: str):
         # Re-raise the exception so ARQ knows the job failed
         raise
 
+
+
+async def generate_video_task(ctx, video_id: int, style: str):
+    """
+    The main ARQ task for generating a complete video.
+    This function will call the existing async logic from app.tasks.
+    """
+    logging.info(f"ARQ worker picked up video generation job for video_id: {video_id} with style '{style}'")
+    
+    # REMOVED: loop = asyncio.get_running_loop()
+
+    try:
+        style_parts = style.split(':')
+        voice = style_parts[0]
+        video_style = style_parts[1] if len(style_parts) > 1 else "dark_gradient"
+
+        speecht5_voices = {"atlas", "nova", "echo", "breeze"}
+        
+        if voice in speecht5_voices:
+            logging.info(f"Awaiting SpeechT5 process for video_id: {video_id}")
+            
+            # --- THE CORRECT WAY for async-to-async calls ---
+            await process_video_generation_speecht5(
+                video_id=video_id,
+                voice_name=voice,
+                video_style=video_style
+            )
+        else:
+            logging.info(f"Awaiting default gTTS process for video_id: {video_id}")
+
+            # --- THE CORRECT WAY for async-to-async calls ---
+            await process_video_generation(
+                video_id=video_id,
+                style=style
+            )
+        
+        logging.info(f"Successfully completed video generation for video_id: {video_id}")
+        return f"Success for video_id: {video_id}"
+
+    except Exception as e:
+        logging.error(f"Video generation FAILED for video_id: {video_id}. Error: {e}", exc_info=True)
+        raise
+
+
 # --- This is the ARQ Worker Configuration ---
 # It tells ARQ which functions are jobs and how to connect to Redis.
 class WorkerSettings:
-    functions = [generate_audio_task]
+    functions = [generate_audio_task, generate_video_task]
     # This default Redis connection setting assumes Redis is running on localhost:6379
     # which is exactly what our Docker command did.
 
