@@ -17,11 +17,17 @@ from app.tasks import process_video_generation
 from fastapi.responses import JSONResponse
 from app.tasks import process_video_generation, process_video_generation_speecht5, process_video_generation_animatediff
 
+from arq import create_pool
+from arq.connections import RedisSettings
+
+
 
 
 # --- APPLICATION SETUP ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+redis = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -30,15 +36,25 @@ async def lifespan(app: FastAPI):
     - On startup: Initializes the audio models.
     - On shutdown: Disposes of the database engine.
     """
+    global redis
+
     logger.info("Application starting up...")
     
     # Load the heavy AI/ML models once at the beginning.
     await audio_generator.initialize_tts_models()
+
+    logger.info("Initializing ARQ Redis connection pool")
+    redis = await create_pool(RedisSettings())
+    logger.info("ARQ Redis pool initialized")
     
     logger.info("Application startup complete.")
     yield # The application runs here
     
     logger.info("Application shutting down...")
+    logger.info("Closing ARQ Redis connection pool")
+    await redis.close()
+    logger.info("ARQ Redis pool closed.")
+
     await engine.dispose()
     logger.info("Database engine disposed.")
 
@@ -388,3 +404,24 @@ async def generate_animatediff_endpoint(
         await db.rollback()
         logger.error(f"Failed to initiate AnimateDiff job for quote {request.quote_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create AnimateDiff job.")
+    
+@app.post("/test-audio-job/", status_code=status.HTTP_202_ACCEPTED)
+async def test_audio_job_endpoint():
+    """
+    A simple endpoint to test enqueuing a job for our ARQ worker.
+    This will call the `generate_audio_task` function in worker.py.
+    """
+    logger.info("Received request to test ARQ audio job.")
+    
+    quote_text_for_test = "Success is not final, failure is not fatal: it is the courage to continue that counts."
+    output_filename = f"static/audio/test_job_{uuid.uuid4()}.wav"
+
+    # This is the key command to send a job to the worker.
+    await redis.enqueue_job(
+        "generate_audio_task",         # The name of the function in worker.py
+        quote_text_for_test,           # The first argument (quote_text)
+        output_filename                # The second argument (audio_file_path)
+    )
+
+    logger.info(f"Successfully enqueued audio job. Output will be at: {output_filename}")
+    return {"message": "Job enqueued successfully.", "output_path": output_filename}
