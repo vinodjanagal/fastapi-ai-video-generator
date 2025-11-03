@@ -276,64 +276,48 @@ async def generate_audio_endpoint(request: schemas.AudioCreateRequest):
 
 
 # This is the replacement for your old synchronous endpoint.
+
 @app.post("/generate-video/", response_model=schemas.VideoAcceptedResponse, status_code=status.HTTP_202_ACCEPTED, summary="Submit a video generation job")
 async def generate_video_endpoint(
     request: schemas.VideoGenerateRequest,
-    background_tasks: BackgroundTasks,
+    # background_tasks: BackgroundTasks, # << DELETE THIS LINE
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Accepts a video generation request and starts the process in the background.
+    Accepts a video generation request and starts the process in the background using ARQ.
     This endpoint returns immediately with a job ID.
     """
     try:
         logger.info(f"Received request to generate video for quote_id: {request.quote_id}")
         db_quote = await crud.get_quote(db=db, quote_id=request.quote_id)
         if not db_quote:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quote not found.")
+            raise HTTPException(status_code=status.HTTP_4_NOT_FOUND, detail="Quote not found.")
 
-        # Stage 1: Create the 'job ticket' in the database.
+        # This part stays the same
         new_video = await crud.create_video_record(db, quote_id=db_quote.id)
         await db.commit()
         await db.refresh(new_video)
         logger.info(f"Created pending video record with ID: {new_video.id}")
 
-        
-        style_parts = request.style.split(':')
-        voice = style_parts[0]
-        video_style = style_parts[1] if len(style_parts) > 1 else "dark_gradient" # Default video style
-
-        speecht5_voices = {"atlas", "nova", "echo", "breeze"}
-        
-        if voice in speecht5_voices:
-            logger.info(f"Enqueuing SpeechT5 task with voice: {voice} and video style: {video_style}")
-            background_tasks.add_task(
-                process_video_generation_speecht5,
-                video_id=new_video.id,
-                voice_name=voice,
-                video_style=video_style
-            )
-        else:
-            # Fallback to the original gTTS engine, using the whole style string
-            logger.info(f"Enqueuing default gTTS task with style: {request.style}")
-            background_tasks.add_task(
-                process_video_generation,
-                video_id=new_video.id,
-                style=request.style
-            )
-        # ----------------------------
+        # --- REPLACE THE ENTIRE OLD if/else BLOCK WITH THIS ---
+        logger.info(f"Enqueuing ARQ job 'generate_video_task' for video_id: {new_video.id}")
+        await redis.enqueue_job(
+            "generate_video_task",  # The string name of our new worker function
+            new_video.id,           # The first argument (video_id)
+            request.style           # The second argument (style)
+        )
+        # ----------------------------------------------------
 
         return {
             "video_id": new_video.id,
             "status_url": f"/videos/{new_video.id}",
             "message": "Video generation has been accepted and is processing in the background."
         }
-
     except Exception as e:
         await db.rollback()
         logger.error(f"Failed to initiate video generation for quote {request.quote_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create video generation job.")
-
+    
 # --- ADDED: NEW ENDPOINT TO CHECK JOB STATUS ---
 @app.get("/videos/{video_id}", response_model=schemas.VideoStatusResponse, summary="Get Video Generation Status")
 async def get_video_status_endpoint(video_id: int, db: AsyncSession = Depends(get_db)):
