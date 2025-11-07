@@ -17,6 +17,7 @@ from app.tasks import process_video_generation
 from fastapi.responses import JSONResponse
 from app.tasks import process_video_generation, process_video_generation_speecht5, process_video_generation_animatediff
 
+from app.tasks import process_semantic_video_generation
 from arq import create_pool
 from arq.connections import RedisSettings
 
@@ -353,13 +354,8 @@ class AnimateDiffGenerateRequest(BaseModel):
 @app.post("/generate-animatediff-video/", response_model=schemas.VideoAcceptedResponse, status_code=202)
 async def generate_animatediff_endpoint(
     request: AnimateDiffGenerateRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Accepts a job to generate a short, animated video using AnimateDiff.
-    This is a VERY slow, resource-intensive process.
-    """
     logger.info(f"Received AnimateDiff request for quote_id: {request.quote_id}")
 
     quote = await crud.get_quote(db, quote_id=request.quote_id)
@@ -370,24 +366,27 @@ async def generate_animatediff_endpoint(
         new_video = await crud.create_video_record(db, quote_id=request.quote_id)
         await db.commit()
         await db.refresh(new_video)
-        
-        logger.info(f"Enqueuing AnimateDiff background task for video_id: {new_video.id}")
-        background_tasks.add_task(
-            process_video_generation_animatediff,
-            video_id=new_video.id,
-            prompt=request.prompt,
-            voice_name=request.voice
+
+        # ✅ Instead of BackgroundTasks → Use ARQ for safety
+        logger.info(f"Enqueuing AnimateDiff job to ARQ for video_id: {new_video.id}")
+        await redis.enqueue_job(
+            "process_video_generation_animatediff",
+            new_video.id,
+            request.prompt,
+            request.voice
         )
 
         return {
             "video_id": new_video.id,
             "status_url": f"/videos/{new_video.id}",
-            "message": "AnimateDiff video generation accepted. This will be very slow."
+            "message": "AnimateDiff video generation started using ARQ (long process)."
         }
     except Exception as e:
         await db.rollback()
-        logger.error(f"Failed to initiate AnimateDiff job for quote {request.quote_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to create AnimateDiff job.")
+        logger.error(f"Failed to enqueue AnimateDiff: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to start AnimateDiff job.")
+
+
     
 @app.post("/test-audio-job/", status_code=status.HTTP_202_ACCEPTED)
 async def test_audio_job_endpoint():
@@ -409,3 +408,38 @@ async def test_audio_job_endpoint():
 
     logger.info(f"Successfully enqueued audio job. Output will be at: {output_filename}")
     return {"message": "Job enqueued successfully.", "output_path": output_filename}
+
+
+
+class SemanticVideoRequest(BaseModel):
+    quote_id: int
+
+@app.post("/generate-semantic-video/", response_model=schemas.VideoAcceptedResponse, status_code=202)
+async def generate_semantic_video_endpoint(request: SemanticVideoRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Triggers the FULL Semantic Pipeline:
+    1. Generate audio (SpeechT5)
+    2. Generate timestamp JSON
+    3. Generate storyboard via LLM (Groq API)
+    4. Calculate scene durations
+    5. Call AnimateDiff per scene
+    6. Assemble final video
+    """
+    logger.info(f"Semantic video requested for quote_id: {request.quote_id}")
+
+    quote = await crud.get_quote(db, quote_id=request.quote_id)
+    if not quote:
+        raise HTTPException(status_code=404, detail="Quote not found")
+
+    new_video = await crud.create_video_record(db, quote_id=request.quote_id)
+    await db.commit()
+    await db.refresh(new_video)
+
+    logger.info(f"Enqueuing semantic pipeline for video_id={new_video.id} in ARQ")
+    await redis.enqueue_job("process_semantic_video_generation", new_video.id)
+
+    return {
+        "video_id": new_video.id,
+        "status_url": f"/videos/{new_video.id}",
+        "message": "Semantic pipeline started (this will take a long time)."
+    }

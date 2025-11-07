@@ -1,386 +1,430 @@
-import logging
 import os
-import uuid
-from typing import Optional
-
-from app.database import AsyncSessionLocal
-from app import crud, models, schemas
-# We are assuming these are the correct import paths for your generators
-from app import audio_generator_gtts as audio_generator
-from app import video_generator
-import subprocess
 import sys
 import json
+import uuid
 import shutil
+import logging
+import asyncio
+from typing import List, Dict, Optional, Tuple
+
+from app.database import AsyncSessionLocal
+from app import crud, models
+from app import audio_generator_gtts as audio_generator
+from app import video_generator
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 VIDEO_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "static", "videos")
-# Ensure the directory exists on startup
 os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
 
+# ---------- Tunables ----------
+SPEECH_TIMEOUT = 86_400     # 24h
+AD_FRAME_TIMEOUT = 86_400   # 24h
+STORYBOARD_TIMEOUT = 86_400   # 5m is plenty for LLM call via CLI wrapper
+TIMESTAMPS_TIMEOUT = 86_400    # 10m if you later split timestamps engine out
+DEFAULT_FPS = 8
 
+# ---------- Async subprocess helper (non-blocking, streamed logs) ----------
+async def run_subprocess_streamed(
+    cmd: List[str],
+    timeout: Optional[int] = None,
+    env: Optional[dict] = None,
+    cwd: Optional[str] = None,
+) -> Tuple[int, str, str]:
+    """
+    Run a subprocess without blocking the event loop.
+    Streams stdout/stderr to logs and also returns full captured text.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+        cwd=cwd,
+    )
+
+    stdout_chunks, stderr_chunks = [], []
+
+    async def _pipe(stream, sink, log_fn):
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode(errors="ignore")
+            sink.append(text)
+            log_fn(text.rstrip("\n"))
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                _pipe(proc.stdout, stdout_chunks, logger.info),
+                _pipe(proc.stderr, stderr_chunks, logger.warning),
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise TimeoutError(f"Subprocess timed out after {timeout}s: {' '.join(cmd)}")
+
+    rc = await proc.wait()
+    return rc, "".join(stdout_chunks), "".join(stderr_chunks)
+
+# ---------- Existing light pipeline (gTTS) ----------
 async def process_video_generation(video_id: int, style: str):
-    """
-    A hardened background task that generates a video, ensures transactional integrity,
-    and cleans up resources on failure.
-    """
-    logger.info(f"TASK STARTED for video_id: {video_id}, style: '{style}'")
-
-    # Step 1: Create a new, independent database session for this task.
-    db = AsyncSessionLocal()
-    
-    # --- Resource Tracking ---
-    # We define these here to track any created files for cleanup in the `finally` block.
+    logger.info(f"TASK STARTED for video_id={video_id}, style='{style}'")
     audio_path: Optional[str] = None
     video_path: Optional[str] = None
 
-    try:
-        # Step 2: Fetch the record using our eager-loading CRUD function.
-        # This gets the video, quote, and author all in one efficient DB query.
-        video_record = await crud.get_video(db, video_id=video_id)
-        if not video_record:
-            logger.error(f"Video record {video_id} not found. Aborting task.")
-            return
-
-        # Step 3: "Claim" the job by setting its status to PROCESSING.
-        # We commit this immediately so the API frontend can see the job has started.
-        await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
-        await db.commit()
-        logger.info(f"Video {video_id} status set to PROCESSING.")
-
-        quote = video_record.quote
-
-        # Step 4: Perform the slow, heavy work (Audio & Video Generation).
-        unique_id = uuid.uuid4()
-        audio_filename = f"quote_{quote.id}_{unique_id}.mp3"
-        video_filename = f"quote_{quote.id}_{unique_id}.mp4"
-        
-        # Store the full paths for generation and potential cleanup.
-        audio_path = os.path.join(VIDEO_OUTPUT_DIR, audio_filename)
-        video_path = os.path.join(VIDEO_OUTPUT_DIR, video_filename)
-
-        logger.info(f"Generating audio for video {video_id} -> {audio_path}")
-        await audio_generator.generate_audio_from_text(
-            text=quote.text,
-            output_filename=audio_path
-        )
-
-        logger.info(f"Generating video for video {video_id} -> {video_path}")
-        final_video_path = await video_generator.create_typography_video(
-            audio_path=audio_path,
-            text=quote.text,
-            author_name=quote.author.name,
-            output_path=video_path,
-            style=style
-        )
-        
-        # --- This is a test point. To check failure, you can uncomment the next line: ---
-        # raise ValueError("A deliberate error to test the failure path!")
-
-        # Step 5: If all work is successful, finalize the record.
-        await crud.update_video_record(
-            db,
-            video=video_record,
-            status=models.VideoStatus.COMPLETED,
-            video_path=final_video_path
-        )
-        await db.commit()
-        logger.info(f"TASK SUCCESS for video {video_id}. Path: {final_video_path}")
-
-    except Exception as e:
-        # Step 6: If ANY exception occurs, handle the failure gracefully.
-        logger.error(f"TASK FAILED for video {video_id}: {e}", exc_info=True)
-        
-        # Rollback any uncommitted changes from the failed 'try' block.
-        await db.rollback()
-        
-        # We must fetch the record again in a clean session state to update it.
-        video_record_to_fail = await crud.get_video(db, video_id=video_id)
-        if video_record_to_fail:
-            await crud.update_video_record(
-                db,
-                video=video_record_to_fail,
-                status=models.VideoStatus.FAILED,
-                error_message=str(e)
-            )
-            await db.commit()
-            logger.warning(f"Set video {video_id} status to FAILED in the database.")
-
-    finally:
-        # Step 7: This block runs ALWAYS, whether the task succeeded or failed.
-        # It's our ultimate safety net for cleaning up resources.
-        
-        # Re-fetch the record's final status to decide if we should clean up.
-        final_video_record = await crud.get_video(db, video_id=video_id)
-        if final_video_record and final_video_record.status == models.VideoStatus.FAILED:
-            logger.warning(f"Cleaning up artifacts for failed video job {video_id}.")
-            # Clean up audio file if it exists
-            if audio_path and os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                    logger.info(f"Removed failed audio artifact: {audio_path}")
-                except OSError as err:
-                    logger.error(f"Error removing file {audio_path}: {err}")
-            # Clean up video file if it exists
-            if video_path and os.path.exists(video_path):
-                try:
-                    os.remove(video_path)
-                    logger.info(f"Removed failed video artifact: {video_path}")
-                except OSError as err:
-                    logger.error(f"Error removing file {video_path}: {err}")
-        
-        # On success, we only clean up the intermediate audio file.
-        elif final_video_record and final_video_record.status == models.VideoStatus.COMPLETED:
-            if audio_path and os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                    logger.info(f"Removed intermediate audio file: {audio_path}")
-                except OSError as err:
-                    logger.error(f"Error removing intermediate file {audio_path}: {err}")
-            
-        # ALWAYS close the database session to return the connection to the pool.
-        await db.close()
-        logger.info(f"TASK FINISHED for video_id: {video_id}. Database session closed.") 
-
-async def process_video_generation_speecht5(video_id: int, voice_name: str, video_style: str):
-
-    """
-    A hardened background task that uses the EXTERNAL speecht5_engine.py script
-    via a subprocess to generate high-quality audio, then generates the video.
-    """
-    logger.info(f"TASK STARTED (SpeechT5) for video_id: {video_id}, voice: '{voice_name}'")
-
-    db = AsyncSessionLocal()
-
-    audio_path: Optional[str] = None
-    video_path: Optional[str] = None
-
-    try:
-        video_record = await crud.get_video(db, video_id= video_id)
-        if not video_record:
-            logger.error(f"Video record {video_id} not found. Aborting task")
-            return
-        
-        await crud.update_video_record(db, video= video_record, status= models.VideoStatus.PROCESSING)
-        await db.commit()
-        logger.info(f"Video {video_id} status set to PROCESSING")
-
-        quote = video_record.quote
-
-
-        # --- Step 1: Define paths for the external script ---
-        unique_id = uuid.uuid4()
-        audio_filename= f"quote_{quote.id}_{unique_id}.mp3"
-        video_filename= f"quote_{quote.id}_{unique_id}.mp4"
-
-        audio_path = os.path.join(VIDEO_OUTPUT_DIR, audio_filename)
-        video_path = os.path.join(VIDEO_OUTPUT_DIR, video_filename)
-
-        script_path = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
-
-
-        # --- Step 2: Build and run the audio engine subprocess ---
-
-
-        logger.info(f"Executing speecht5_engine.py for video {video_id}...")
-        cmd = [
-            sys.executable,          # The current python interpreter (ensures same venv)
-            script_path,             # Path to our engine script
-            "--text", quote.text,
-            "--output-path", audio_path,
-            "--voice", voice_name
-        ]
-        
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=86400)
-
-        # --- Step 3: Check the result of the subprocess ---
-        if proc.returncode != 0:
-            error_message = f"speecht5_engine.py failed!\nExit Code: {proc.returncode}\nStderr: {proc.stderr}"
-            raise RuntimeError(error_message)
-
+    async with AsyncSessionLocal() as db:
         try:
-            result = json.loads(proc.stdout)
-            if result.get("status") != "COMPLETED":
-                raise ValueError(f"SpeechT5 engine reported failure: {result.get('error', 'Unknown error')}")
-            logger.info(f"speecht5_engine.py completed. Audio at: {result.get('file')}")
-        except (json.JSONDecodeError, ValueError) as e:
-            raise RuntimeError(f"Failed to parse output from speecht5_engine.py. Stdout: {proc.stdout}\nError: {e}")
+            video_record = await crud.get_video(db, video_id=video_id)
+            if not video_record:
+                logger.error(f"Video {video_id} not found.")
+                return
 
-        # --- Step 4: Proceed with video generation ---
-        logger.info(f"Generating video for video {video_id} -> {video_path}")
-        final_video_path = await video_generator.create_typography_video(
-            audio_path=audio_path,
-            text=quote.text,
-            author_name=quote.author.name,
-            output_path=video_path,
-            style=video_style
-        )
-        
-        await crud.update_video_record(
-            db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
-        )
-        await db.commit()
-        logger.info(f"TASK SUCCESS (SpeechT5) for video {video_id}. Path: {final_video_path}")
+            await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
+            await db.commit()
 
-    except Exception as e:
-        logger.error(f"TASK FAILED (SpeechT5) for video {video_id}: {e}", exc_info=True)
-        await db.rollback()
-        video_record_to_fail = await crud.get_video(db, video_id=video_id)
-        if video_record_to_fail:
+            quote = video_record.quote
+            uid = uuid.uuid4()
+            audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp3")
+            video_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp4")
+
+            logger.info(f"Generating audio -> {audio_path}")
+            await audio_generator.generate_audio_from_text(text=quote.text, output_filename=audio_path)
+
+            logger.info(f"Generating video -> {video_path}")
+            final_video_path = await video_generator.create_typography_video(
+                audio_path=audio_path,
+                text=quote.text,
+                author_name=quote.author.name,
+                output_path=video_path,
+                style=style,
+            )
+
             await crud.update_video_record(
-                db, video=video_record_to_fail, status=models.VideoStatus.FAILED, error_message=str(e)
+                db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
             )
             await db.commit()
-            logger.warning(f"Set video {video_id} status to FAILED in the database.")
+            logger.info(f"TASK SUCCESS for video {video_id}. Path: {final_video_path}")
 
-    finally:
-        # The cleanup logic is identical and works perfectly.
-        final_video_record = await crud.get_video(db, video_id=video_id)
-        if final_video_record and final_video_record.status == models.VideoStatus.FAILED:
-            logger.warning(f"Cleaning up artifacts for failed SpeechT5 job {video_id}.")
-            if audio_path and os.path.exists(audio_path):
-                try: os.remove(audio_path)
-                except OSError as err: logger.error(f"Error removing file {audio_path}: {err}")
-            if video_path and os.path.exists(video_path):
-                try: os.remove(video_path)
-                except OSError as err: logger.error(f"Error removing file {video_path}: {err}")
-        
-        elif final_video_record and final_video_record.status == models.VideoStatus.COMPLETED:
-            if audio_path and os.path.exists(audio_path):
-                try: os.remove(audio_path)
-                except OSError as err: logger.error(f"Error removing intermediate file {audio_path}: {err}")
-            
-        await db.close()
-        logger.info(f"TASK FINISHED (SpeechT5) for video_id: {video_id}. Database session closed.")
+        except Exception as e:
+            logger.error(f"TASK FAILED for video {video_id}: {e}", exc_info=True)
+            await db.rollback()
+            vr = await crud.get_video(db, video_id=video_id)
+            if vr:
+                await crud.update_video_record(db, video=vr, status=models.VideoStatus.FAILED, error_message=str(e))
+                await db.commit()
+        finally:
+            vr_final = await crud.get_video(db, video_id=video_id)
+            if vr_final and vr_final.status == models.VideoStatus.FAILED:
+                if audio_path and os.path.exists(audio_path):
+                    try: os.remove(audio_path); logger.info(f"Removed failed audio: {audio_path}")
+                    except OSError as err: logger.error(f"Remove audio error: {err}")
+                if video_path and os.path.exists(video_path):
+                    try: os.remove(video_path); logger.info(f"Removed failed video: {video_path}")
+                    except OSError as err: logger.error(f"Remove video error: {err}")
+            elif vr_final and vr_final.status == models.VideoStatus.COMPLETED:
+                if audio_path and os.path.exists(audio_path):
+                    try: os.remove(audio_path); logger.info(f"Removed intermediate audio: {audio_path}")
+                    except OSError as err: logger.error(f"Remove intermediate audio error: {err}")
+            logger.info(f"TASK FINISHED for video_id={video_id}")
 
+# ---------- SpeechT5 external engine pipeline ----------
+async def process_video_generation_speecht5(video_id: int, voice_name: str, video_style: str):
+    logger.info(f"TASK STARTED (SpeechT5) for video_id={video_id}, voice='{voice_name}'")
+    audio_path: Optional[str] = None
+    video_path: Optional[str] = None
 
+    async with AsyncSessionLocal() as db:
+        try:
+            video_record = await crud.get_video(db, video_id=video_id)
+            if not video_record:
+                logger.error(f"Video {video_id} not found.")
+                return
 
+            await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
+            await db.commit()
 
+            quote = video_record.quote
+            uid = uuid.uuid4()
+            audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp3")
+            video_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp4")
 
+            script_path = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
+            cmd = [sys.executable, script_path, "--text", quote.text, "--output-path", audio_path, "--voice", voice_name]
+
+            rc, out, err = await run_subprocess_streamed(
+                cmd, timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
+            )
+            if rc != 0:
+                raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
+
+            try:
+                result = json.loads(out)
+                if result.get("status") != "COMPLETED":
+                    raise ValueError(result.get("error", "Unknown SpeechT5 error"))
+            except Exception as e:
+                raise RuntimeError(f"Invalid SpeechT5 stdout. Stdout:\n{out}\nError: {e}")
+
+            logger.info(f"Audio OK -> {audio_path}")
+
+            final_video_path = await video_generator.create_typography_video(
+                audio_path=audio_path,
+                text=quote.text,
+                author_name=quote.author.name,
+                output_path=video_path,
+                style=video_style,
+            )
+
+            await crud.update_video_record(
+                db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
+            )
+            await db.commit()
+            logger.info(f"TASK SUCCESS (SpeechT5) for video {video_id}. Path: {final_video_path}")
+
+        except Exception as e:
+            logger.error(f"TASK FAILED (SpeechT5) for video {video_id}: {e}", exc_info=True)
+            await db.rollback()
+            vr = await crud.get_video(db, video_id=video_id)
+            if vr:
+                await crud.update_video_record(db, video=vr, status=models.VideoStatus.FAILED, error_message=str(e))
+                await db.commit()
+        finally:
+            vr_final = await crud.get_video(db, video_id=video_id)
+            if vr_final and vr_final.status == models.VideoStatus.FAILED:
+                if audio_path and os.path.exists(audio_path):
+                    try: os.remove(audio_path)
+                    except OSError as err: logger.error(f"Audio cleanup error: {err}")
+            elif vr_final and vr_final.status == models.VideoStatus.COMPLETED:
+                if audio_path and os.path.exists(audio_path):
+                    try: os.remove(audio_path)
+                    except OSError as err: logger.error(f"Intermediate audio cleanup error: {err}")
+            logger.info(f"TASK FINISHED (SpeechT5) for video_id={video_id}")
+
+# ---------- AnimateDiff full pipeline (single prompt) ----------
 async def process_video_generation_animatediff(video_id: int, prompt: str, voice_name: str):
-    """
-    Orchestrates the full AnimateDiff video generation pipeline:
-    1. Generates audio via the speecht5_engine subprocess.
-    2. Generates frames via the animate_diff_engine subprocess.
-    3. Assembles the final video.
-    4. Cleans up all intermediate files.
-    """
-    logger.info(f"TASK STARTED (AnimateDiff Full Pipeline) for video_id: {video_id}")
-    db = AsyncSessionLocal()
-    
-    # --- Resource Tracking ---
+    logger.info(f"TASK STARTED (AnimateDiff Full) for video_id={video_id}")
     audio_path: Optional[str] = None
     video_path: Optional[str] = None
     frames_dir: Optional[str] = None
 
-    try:
-        video_record = await crud.get_video(db, video_id=video_id)
-        if not video_record:
-            raise FileNotFoundError(f"Video record {video_id} not found.")
+    async with AsyncSessionLocal() as db:
+        try:
+            video_record = await crud.get_video(db, video_id=video_id)
+            if not video_record:
+                raise FileNotFoundError(f"Video record {video_id} not found.")
 
-        await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
-        await db.commit()
-        logger.info(f"Video {video_id} status set to PROCESSING.")
-
-        quote_text = video_record.quote.text
-        unique_id = uuid.uuid4()
-        
-        # --- Define Paths ---
-        audio_filename = f"audio_{unique_id}.mp3"
-        video_filename = f"video_{unique_id}.mp4"
-        frames_dirname = f"frames_{unique_id}"
-        
-        audio_path = os.path.join(VIDEO_OUTPUT_DIR, audio_filename)
-        video_path = os.path.join(VIDEO_OUTPUT_DIR, video_filename)
-        frames_dir = os.path.join(VIDEO_OUTPUT_DIR, frames_dirname)
-        
-        # === STAGE 1: AUDIO GENERATION ===
-        logger.info("Stage 1: Executing speecht5_engine.py...")
-        audio_script_path = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
-        audio_cmd = [
-            sys.executable, audio_script_path,
-            "--text", quote_text,
-            "--output-path", audio_path,
-            "--voice", voice_name
-        ]
-        audio_proc = subprocess.run(audio_cmd, capture_output=True, text=True, check=False, timeout=300)
-        
-        if audio_proc.returncode != 0:
-            raise RuntimeError(f"speecht5_engine.py failed!\nStderr: {audio_proc.stderr}")
-        
-        audio_result = json.loads(audio_proc.stdout)
-        if audio_result.get("status") != "COMPLETED":
-            raise ValueError(f"SpeechT5 engine reported failure: {audio_result.get('error')}")
-        logger.info("Stage 1: Audio generation successful.")
-
-        # === STAGE 2: FRAME GENERATION ===
-        logger.info("Stage 2: Executing animate_diff_engine.py...")
-        frame_script_path = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
-        frame_cmd = [
-            sys.executable, frame_script_path,
-            "--prompt", prompt,
-            "--output-dir", frames_dir
-        ]
-        # Using a very long timeout for the slow frame generation
-        frame_proc = subprocess.run(frame_cmd, capture_output=True, text=True, check=False, timeout=7200)
-
-        if frame_proc.returncode != 0:
-            raise RuntimeError(f"animate_diff_engine.py failed!\nStderr: {frame_proc.stderr}")
-            
-        frame_result = json.loads(frame_proc.stdout)
-        if frame_result.get("status") != "COMPLETED":
-            raise ValueError(f"AnimateDiff engine reported failure: {frame_result.get('error')}")
-            
-        frame_paths = frame_result.get("frame_paths", [])
-        if not frame_paths:
-            raise ValueError("AnimateDiff engine returned no frame paths.")
-        logger.info(f"Stage 2: Frame generation successful ({len(frame_paths)} frames).")
-
-        # === STAGE 3: FINAL ASSEMBLY ===
-        logger.info("Stage 3: Assembling final video from frames and audio...")
-        final_video_path = await video_generator.create_video_from_frames(
-            frame_paths=frame_paths,
-            output_path=video_path,
-            fps=8,  # Lightning model default
-            audio_path=audio_path
-        )
-        logger.info("Stage 3: Video assembly successful.")
-
-        # === STAGE 4: DATABASE UPDATE ===
-        await crud.update_video_record(
-            db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
-        )
-        await db.commit()
-        logger.info(f"TASK SUCCESS (AnimateDiff Full Pipeline) for video {video_id}. Path: {final_video_path}")
-
-    except Exception as e:
-        logger.error(f"TASK FAILED (AnimateDiff Full Pipeline) for video {video_id}: {e}", exc_info=True)
-        await db.rollback()
-        video_record_to_fail = await crud.get_video(db, video_id=video_id)
-        if video_record_to_fail:
-            await crud.update_video_record(
-                db, video=video_record_to_fail, status=models.VideoStatus.FAILED, error_message=str(e)
-            )
+            await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
             await db.commit()
 
-    finally:
-        # === STAGE 5: GUARANTEED CLEANUP ===
-        logger.info(f"Cleaning up intermediate files for job {video_id}...")
-        if audio_path and os.path.exists(audio_path):
+            quote_text = video_record.quote.text
+            uid = uuid.uuid4()
+            audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"audio_{uid}.mp3")
+            video_path = os.path.join(VIDEO_OUTPUT_DIR, f"video_{uid}.mp4")
+            frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"frames_{uid}")
+
+            # Stage 1: Speech
+            audio_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
+            rc, out, err = await run_subprocess_streamed(
+                [sys.executable, audio_script, "--text", quote_text, "--output-path", audio_path, "--voice", voice_name],
+                timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
+            )
+            if rc != 0:
+                raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
             try:
-                os.remove(audio_path)
-                logger.info(f"Cleaned up audio file: {audio_path}")
-            except OSError as err:
-                logger.error(f"Error removing audio file {audio_path}: {err}")
-        
-        if frames_dir and os.path.exists(frames_dir):
+                audio_result = json.loads(out)
+                if audio_result.get("status") != "COMPLETED":
+                    raise ValueError(audio_result.get("error", "Speech error"))
+            except Exception as e:
+                raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
+
+            # Stage 2: Frames
+            frame_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
+            rc2, out2, err2 = await run_subprocess_streamed(
+                [sys.executable, frame_script, "--prompt", prompt, "--output-dir", frames_dir],
+                timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
+            )
+            if rc2 != 0:
+                raise RuntimeError(f"animate_diff_engine.py failed (rc={rc2}). Stderr:\n{err2}")
             try:
-                shutil.rmtree(frames_dir)
-                logger.info(f"Cleaned up frames directory: {frames_dir}")
-            except Exception as e_clean:
-                logger.error(f"Failed to clean up frames directory {frames_dir}: {e_clean}")
-                
-        await db.close()
-        logger.info(f"TASK FINISHED (AnimateDiff Full Pipeline) for video_id: {video_id}. Database session closed.")
+                frame_result = json.loads(out2)
+                if frame_result.get("status") != "COMPLETED":
+                    raise ValueError(frame_result.get("error", "AnimateDiff error"))
+                frame_paths = frame_result.get("frame_paths", [])
+                if not frame_paths:
+                    raise ValueError("No frame_paths from AnimateDiff.")
+            except Exception as e:
+                raise RuntimeError(f"Invalid AnimateDiff stdout.\n{out2}\nError:{e}")
+
+            # Stage 3: Assemble
+            final_video_path = await video_generator.create_video_from_frames(
+                frame_paths=frame_paths, output_path=video_path, fps=DEFAULT_FPS, audio_path=audio_path
+            )
+
+            await crud.update_video_record(
+                db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
+            )
+            await db.commit()
+            logger.info(f"TASK SUCCESS (AnimateDiff Full) for video {video_id}. Path: {final_video_path}")
+
+        except Exception as e:
+            logger.error(f"TASK FAILED (AnimateDiff Full) for video {video_id}: {e}", exc_info=True)
+            await db.rollback()
+            vr = await crud.get_video(db, video_id=video_id)
+            if vr:
+                await crud.update_video_record(db, video=vr, status=models.VideoStatus.FAILED, error_message=str(e))
+                await db.commit()
+        finally:
+            logger.info(f"Cleanup intermediates for job {video_id}...")
+            if audio_path and os.path.exists(audio_path):
+                try: os.remove(audio_path)
+                except OSError as err: logger.error(f"Audio cleanup error: {err}")
+            if frames_dir and os.path.exists(frames_dir):
+                try: shutil.rmtree(frames_dir)
+                except Exception as e_clean: logger.error(f"Frames cleanup error: {e_clean}")
+            logger.info(f"TASK FINISHED (AnimateDiff Full) for video_id={video_id}")
+
+# ---------- NEW: Semantic Orchestrator ----------
+async def process_semantic_video_generation(video_id: int):
+    """
+    Semantic pipeline:
+      1) Generate master audio (and timestamps) with SpeechT5 engine.
+      2) Generate storyboard with durations using storyboard_engine.py.
+      3) For each scene: run animate_diff_engine.py to create frames.
+      4) Concatenate all frames in order, assemble with master audio.
+      5) Update DB and cleanup.
+    Expects engines to output JSON on stdout:
+      - speecht5_engine.py -> {"status":"COMPLETED","file": "...", "timestamps_file":"..."}  (timestamps_file optional)
+      - storyboard_engine.py -> {"status":"COMPLETED","storyboard":[{scene_description,animation_prompt,start_time,end_time,duration},...]}
+      - animate_diff_engine.py -> {"status":"COMPLETED","frame_paths":[...]}
+    """
+    logger.info(f"ORCHESTRATOR START video_id={video_id}")
+
+    audio_path: Optional[str] = None
+    timestamps_path: Optional[str] = None
+    final_video_path: Optional[str] = None
+    scene_temp_dirs: List[str] = []
+    all_frame_paths: List[str] = []
+
+    async with AsyncSessionLocal() as db:
+        try:
+            video_record = await crud.get_video(db, video_id=video_id)
+            if not video_record:
+                raise FileNotFoundError(f"Video {video_id} not found.")
+
+            await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
+            await db.commit()
+
+            quote_text = video_record.quote.text
+            uid = uuid.uuid4()
+
+            # ---------- 1) Speech (master audio + timestamps) ----------
+            audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_audio_{uid}.mp3")
+            speech_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
+            speech_cmd = [sys.executable, speech_script, "--text", quote_text, "--output-path", audio_path]
+
+            logger.info("ORCH: Running SpeechT5 (audio + timestamps)...")
+            rc, out, err = await run_subprocess_streamed(
+                speech_cmd, timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
+            )
+            if rc != 0:
+                raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
+            try:
+                speech_json = json.loads(out)
+                if speech_json.get("status") != "COMPLETED":
+                    raise ValueError(speech_json.get("error", "Speech engine error"))
+                timestamps_path = speech_json.get("timestamps_file")  # optional
+            except Exception as e:
+                raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
+
+            # ---------- 2) Storyboard (with durations) ----------
+            storyboard_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "storyboard_engine.py")
+            storyboard_cmd = [sys.executable, storyboard_script, "--quote", quote_text]
+            if timestamps_path and os.path.exists(timestamps_path):
+                storyboard_cmd += ["--timestamps", timestamps_path]
+
+            logger.info("ORCH: Running Storyboard engine...")
+            rc2, out2, err2 = await run_subprocess_streamed(
+                storyboard_cmd, timeout=STORYBOARD_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
+            )
+            if rc2 != 0:
+                raise RuntimeError(f"storyboard_engine.py failed (rc={rc2}). Stderr:\n{err2}")
+
+            try:
+                sb_json = json.loads(out2)
+                if sb_json.get("status") != "COMPLETED":
+                    raise ValueError(sb_json.get("error", "Storyboard engine error"))
+                storyboard = sb_json.get("storyboard", [])
+                if not storyboard:
+                    raise ValueError("Storyboard returned empty.")
+            except Exception as e:
+                raise RuntimeError(f"Invalid storyboard stdout.\n{out2}\nError:{e}")
+
+            # ---------- 3) Per-scene AnimateDiff ----------
+            ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
+            for idx, scene in enumerate(storyboard, start=1):
+                prompt = scene.get("animation_prompt")
+                if not prompt:
+                    raise ValueError(f"Scene {idx} has no 'animation_prompt'.")
+                frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"scene_{idx}_{uuid.uuid4().hex}")
+                scene_temp_dirs.append(frames_dir)
+
+                logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → AnimateDiff")
+                ad_cmd = [sys.executable, ad_script, "--prompt", prompt, "--output-dir", frames_dir]
+                # You can pass duration/fps here if your engine supports it:
+                # if "duration" in scene: ad_cmd += ["--seconds", str(scene["duration"])]
+
+                rc3, out3, err3 = await run_subprocess_streamed(
+                    ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
+                )
+                if rc3 != 0:
+                    raise RuntimeError(f"animate_diff_engine.py failed (scene {idx}) rc={rc3}. Stderr:\n{err3}")
+
+                try:
+                    ad_json = json.loads(out3)
+                    if ad_json.get("status") != "COMPLETED":
+                        raise ValueError(ad_json.get("error", f"AnimateDiff scene {idx} error"))
+                    frame_paths = ad_json.get("frame_paths", [])
+                    if not frame_paths:
+                        raise ValueError(f"AnimateDiff scene {idx} returned no frames.")
+                    all_frame_paths.extend(frame_paths)
+                except Exception as e:
+                    raise RuntimeError(f"Invalid AnimateDiff stdout (scene {idx}).\n{out3}\nError:{e}")
+
+            # ---------- 4) Assemble final video ----------
+            final_video_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_video_{uid}.mp4")
+            logger.info("ORCH: Assembling final video with master audio...")
+            final_path = await video_generator.create_video_from_frames(
+                frame_paths=all_frame_paths,
+                output_path=final_video_path,
+                fps=DEFAULT_FPS,
+                audio_path=audio_path,
+            )
+
+            # ---------- 5) Update DB ----------
+            await crud.update_video_record(
+                db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_path
+            )
+            await db.commit()
+            logger.info(f"ORCHESTRATOR SUCCESS video_id={video_id}. Path: {final_path}")
+
+        except Exception as e:
+            logger.error(f"ORCHESTRATOR FAILED video_id={video_id}: {e}", exc_info=True)
+            await db.rollback()
+            vr = await crud.get_video(db, video_id=video_id)
+            if vr:
+                await crud.update_video_record(db, video=vr, status=models.VideoStatus.FAILED, error_message=str(e))
+                await db.commit()
+        finally:
+            # Cleanup intermediates (audio + per-scene dirs)
+            if audio_path and os.path.exists(audio_path):
+                try: os.remove(audio_path)
+                except OSError as err: logger.error(f"Audio cleanup error: {err}")
+            for d in scene_temp_dirs:
+                if d and os.path.exists(d):
+                    try: shutil.rmtree(d)
+                    except Exception as err: logger.error(f"Scene dir cleanup error: {err}")
+            logger.info(f"ORCHESTRATOR FINISHED video_id={video_id}")
