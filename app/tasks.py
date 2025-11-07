@@ -204,6 +204,8 @@ async def process_video_generation_speecht5(video_id: int, voice_name: str, vide
                     except OSError as err: logger.error(f"Intermediate audio cleanup error: {err}")
             logger.info(f"TASK FINISHED (SpeechT5) for video_id={video_id}")
 
+
+
 # ---------- AnimateDiff full pipeline (single prompt) ----------
 async def process_video_generation_animatediff(video_id: int, prompt: str, voice_name: str):
     logger.info(f"TASK STARTED (AnimateDiff Full) for video_id={video_id}")
@@ -243,8 +245,19 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
 
             # Stage 2: Frames
             frame_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
+            
+            # === THE ONLY CHANGE IS HERE: Golden Configuration Applied ===
+            frame_cmd = [
+                sys.executable,
+                frame_script,
+                "--prompt", prompt,
+                "--output-dir", frames_dir,
+                "--num-steps", "4",
+                "--guidance-scale", "1.5"
+            ]
+
             rc2, out2, err2 = await run_subprocess_streamed(
-                [sys.executable, frame_script, "--prompt", prompt, "--output-dir", frames_dir],
+                frame_cmd,
                 timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
             )
             if rc2 != 0:
@@ -286,6 +299,8 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
                 try: shutil.rmtree(frames_dir)
                 except Exception as e_clean: logger.error(f"Frames cleanup error: {e_clean}")
             logger.info(f"TASK FINISHED (AnimateDiff Full) for video_id={video_id}")
+
+
 
 # ---------- NEW: Semantic Orchestrator ----------
 async def process_semantic_video_generation(video_id: int):
@@ -363,6 +378,7 @@ async def process_semantic_video_generation(video_id: int):
             except Exception as e:
                 raise RuntimeError(f"Invalid storyboard stdout.\n{out2}\nError:{e}")
 
+
             # ---------- 3) Per-scene AnimateDiff ----------
             ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
             for idx, scene in enumerate(storyboard, start=1):
@@ -373,9 +389,16 @@ async def process_semantic_video_generation(video_id: int):
                 scene_temp_dirs.append(frames_dir)
 
                 logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → AnimateDiff")
-                ad_cmd = [sys.executable, ad_script, "--prompt", prompt, "--output-dir", frames_dir]
-                # You can pass duration/fps here if your engine supports it:
-                # if "duration" in scene: ad_cmd += ["--seconds", str(scene["duration"])]
+                
+                # === THE ONLY CHANGE IS HERE: Golden Configuration Applied ===
+                ad_cmd = [
+                    sys.executable,
+                    ad_script,
+                    "--prompt", prompt,
+                    "--output-dir", frames_dir,
+                    "--num-steps", "4",
+                    "--guidance-scale", "1.5"
+                ]
 
                 rc3, out3, err3 = await run_subprocess_streamed(
                     ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
@@ -428,3 +451,4 @@ async def process_semantic_video_generation(video_id: int):
                     try: shutil.rmtree(d)
                     except Exception as err: logger.error(f"Scene dir cleanup error: {err}")
             logger.info(f"ORCHESTRATOR FINISHED video_id={video_id}")
+
