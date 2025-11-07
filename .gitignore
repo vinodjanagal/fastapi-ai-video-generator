@@ -44,3 +44,13 @@ resources/
 # Ignore contents of static/ but keep the directory
 static/*
 !static/.gitkeep
+
+# Test scripts
+test_assembly.py
+
+# Output directories from engine tests
+debug/
+debug_output/
+
+# Untracked mystery folder
+python/
