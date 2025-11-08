@@ -1,8 +1,10 @@
+# app/config.py
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import SecretStr, Field
 
-
 class Settings(BaseSettings):
+    # --- YOUR EXISTING SETTINGS ---
     database_url: SecretStr
     jwt_secret_key: SecretStr
     access_token_expire_minutes: int = Field(default=30, ge=1)
@@ -10,9 +12,17 @@ class Settings(BaseSettings):
     max_pages: int = Field(default=10, ge=1, description="Max pages to scrape")
     topic: str = Field(default="perseverance", description="Default topic for quotes")
 
+    # --- THE FIRST FIX: Add the missing key ---
+    groq_api_key: SecretStr
+    
+    # --- THE NEW WAY TO CONFIGURE (Your code is correct) ---
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8"
     )
+
+    # --- THE SECOND FIX: Delete this entire block ---
+    # class Config:
+    #     env_file = ".env"
 
 settings = Settings()

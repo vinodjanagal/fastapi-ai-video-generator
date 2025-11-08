@@ -436,7 +436,7 @@ async def generate_semantic_video_endpoint(request: SemanticVideoRequest, db: As
     await db.refresh(new_video)
 
     logger.info(f"Enqueuing semantic pipeline for video_id={new_video.id} in ARQ")
-    await redis.enqueue_job("process_semantic_video_generation", new_video.id)
+    await redis.enqueue_job("generate_semantic_video_task", new_video.id)
 
     return {
         "video_id": new_video.id,
