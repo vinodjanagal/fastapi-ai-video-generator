@@ -64,7 +64,7 @@ class Video(Base):
     id = Column(Integer, primary_key=True, index=True)
     quote_id = Column(Integer, ForeignKey("quotes.id", ondelete="CASCADE"))
     video_path = Column(String(500), nullable=True)
-    status= Column(Enum(VideoStatus), default= VideoStatus.PENDING, nullable=False)
+    status= Column(String(50), default= VideoStatus.PENDING.value, nullable=False)
     error_message= Column(Text, nullable=True)
     duration_seconds = Column(Integer)
     views = Column(Integer, default=0)
