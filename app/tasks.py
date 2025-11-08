@@ -6,14 +6,13 @@ import shutil
 import logging
 import asyncio
 from typing import List, Dict, Optional, Tuple
-
+from sqlalchemy import Float
 from app.database import AsyncSessionLocal
 from app import crud, models
 from app import audio_generator_gtts as audio_generator
 from app import video_generator
 
 logger = logging.getLogger(__name__)
-
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 VIDEO_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "static", "videos")
 os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
@@ -21,8 +20,8 @@ os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
 # ---------- Tunables ----------
 SPEECH_TIMEOUT = 86_400     # 24h
 AD_FRAME_TIMEOUT = 86_400   # 24h
-STORYBOARD_TIMEOUT = 86_400   # 5m is plenty for LLM call via CLI wrapper
-TIMESTAMPS_TIMEOUT = 86_400    # 10m if you later split timestamps engine out
+STORYBOARD_TIMEOUT = 86_400 # 5m is plenty for LLM call via CLI wrapper
+TIMESTAMPS_TIMEOUT = 86_400 # 10m if you later split timestamps engine out
 DEFAULT_FPS = 8
 
 # ---------- Async subprocess helper (non-blocking, streamed logs) ----------
@@ -43,9 +42,7 @@ async def run_subprocess_streamed(
         env=env,
         cwd=cwd,
     )
-
     stdout_chunks, stderr_chunks = [], []
-
     async def _pipe(stream, sink, log_fn):
         while True:
             line = await stream.readline()
@@ -54,7 +51,6 @@ async def run_subprocess_streamed(
             text = line.decode(errors="ignore")
             sink.append(text)
             log_fn(text.rstrip("\n"))
-
     try:
         await asyncio.wait_for(
             asyncio.gather(
@@ -67,7 +63,6 @@ async def run_subprocess_streamed(
         proc.kill()
         await proc.wait()
         raise TimeoutError(f"Subprocess timed out after {timeout}s: {' '.join(cmd)}")
-
     rc = await proc.wait()
     return rc, "".join(stdout_chunks), "".join(stderr_chunks)
 
@@ -76,25 +71,33 @@ async def process_video_generation(video_id: int, style: str):
     logger.info(f"TASK STARTED for video_id={video_id}, style='{style}'")
     audio_path: Optional[str] = None
     video_path: Optional[str] = None
-
     async with AsyncSessionLocal() as db:
         try:
             video_record = await crud.get_video(db, video_id=video_id)
             if not video_record:
                 logger.error(f"Video {video_id} not found.")
                 return
-
+           
+            # INITIAL STATUS
+            video_record.status = models.VideoStatus.PROCESSING
+            video_record.progress = 0.0
+            await db.merge(video_record)
+            await db.commit()
+            # ---------- PROGRESS HELPER ----------
+            async def update_progress(percent: float, step_name: str):
+                video_record.progress = round(percent, 1)
+                video_record.status = f"PROCESSING: {step_name}"
+                await db.merge(video_record)
+                await db.commit()
+                logger.info(f"Progress: {video_record.progress}% - {step_name}")
             await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
             await db.commit()
-
             quote = video_record.quote
             uid = uuid.uuid4()
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp3")
             video_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp4")
-
             logger.info(f"Generating audio -> {audio_path}")
             await audio_generator.generate_audio_from_text(text=quote.text, output_filename=audio_path)
-
             logger.info(f"Generating video -> {video_path}")
             final_video_path = await video_generator.create_typography_video(
                 audio_path=audio_path,
@@ -103,13 +106,11 @@ async def process_video_generation(video_id: int, style: str):
                 output_path=video_path,
                 style=style,
             )
-
             await crud.update_video_record(
                 db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
             )
             await db.commit()
             logger.info(f"TASK SUCCESS for video {video_id}. Path: {final_video_path}")
-
         except Exception as e:
             logger.error(f"TASK FAILED for video {video_id}: {e}", exc_info=True)
             await db.rollback()
@@ -137,40 +138,32 @@ async def process_video_generation_speecht5(video_id: int, voice_name: str, vide
     logger.info(f"TASK STARTED (SpeechT5) for video_id={video_id}, voice='{voice_name}'")
     audio_path: Optional[str] = None
     video_path: Optional[str] = None
-
     async with AsyncSessionLocal() as db:
         try:
             video_record = await crud.get_video(db, video_id=video_id)
             if not video_record:
                 logger.error(f"Video {video_id} not found.")
                 return
-
             await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
             await db.commit()
-
             quote = video_record.quote
             uid = uuid.uuid4()
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp3")
             video_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp4")
-
             script_path = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
             cmd = [sys.executable, script_path, "--text", quote.text, "--output-path", audio_path, "--voice", voice_name]
-
             rc, out, err = await run_subprocess_streamed(
                 cmd, timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
             )
             if rc != 0:
                 raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
-
             try:
                 result = json.loads(out)
                 if result.get("status") != "COMPLETED":
                     raise ValueError(result.get("error", "Unknown SpeechT5 error"))
             except Exception as e:
                 raise RuntimeError(f"Invalid SpeechT5 stdout. Stdout:\n{out}\nError: {e}")
-
             logger.info(f"Audio OK -> {audio_path}")
-
             final_video_path = await video_generator.create_typography_video(
                 audio_path=audio_path,
                 text=quote.text,
@@ -178,13 +171,11 @@ async def process_video_generation_speecht5(video_id: int, voice_name: str, vide
                 output_path=video_path,
                 style=video_style,
             )
-
             await crud.update_video_record(
                 db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
             )
             await db.commit()
             logger.info(f"TASK SUCCESS (SpeechT5) for video {video_id}. Path: {final_video_path}")
-
         except Exception as e:
             logger.error(f"TASK FAILED (SpeechT5) for video {video_id}: {e}", exc_info=True)
             await db.rollback()
@@ -204,30 +195,37 @@ async def process_video_generation_speecht5(video_id: int, voice_name: str, vide
                     except OSError as err: logger.error(f"Intermediate audio cleanup error: {err}")
             logger.info(f"TASK FINISHED (SpeechT5) for video_id={video_id}")
 
-
-
 # ---------- AnimateDiff full pipeline (single prompt) ----------
 async def process_video_generation_animatediff(video_id: int, prompt: str, voice_name: str):
     logger.info(f"TASK STARTED (AnimateDiff Full) for video_id={video_id}")
     audio_path: Optional[str] = None
     video_path: Optional[str] = None
     frames_dir: Optional[str] = None
-
     async with AsyncSessionLocal() as db:
         try:
             video_record = await crud.get_video(db, video_id=video_id)
             if not video_record:
                 raise FileNotFoundError(f"Video record {video_id} not found.")
-
-            await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
+           
+            # Set initial processing state
+            video_record.status = models.VideoStatus.PROCESSING
+            video_record.progress = 0.0
+            await db.merge(video_record)
             await db.commit()
 
             quote_text = video_record.quote.text
             uid = uuid.uuid4()
+            # ---------- PROGRESS HELPER ----------
+            async def update_progress(percent: float, step_name: str):
+                video_record.progress = round(percent, 1)
+                video_record.status = f"PROCESSING: {step_name}"
+                await db.merge(video_record)
+                await db.commit()
+                logger.info(f"Progress: {video_record.progress}% - {step_name}")
+            # -------------------------------------------------
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"audio_{uid}.mp3")
             video_path = os.path.join(VIDEO_OUTPUT_DIR, f"video_{uid}.mp4")
             frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"frames_{uid}")
-
             # Stage 1: Speech
             audio_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
             rc, out, err = await run_subprocess_streamed(
@@ -242,10 +240,9 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
                     raise ValueError(audio_result.get("error", "Speech error"))
             except Exception as e:
                 raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
-
             # Stage 2: Frames
             frame_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
-            
+           
             # === THE ONLY CHANGE IS HERE: Golden Configuration Applied ===
             frame_cmd = [
                 sys.executable,
@@ -255,7 +252,6 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
                 "--num-steps", "4",
                 "--guidance-scale", "1.5"
             ]
-
             rc2, out2, err2 = await run_subprocess_streamed(
                 frame_cmd,
                 timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
@@ -271,18 +267,15 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
                     raise ValueError("No frame_paths from AnimateDiff.")
             except Exception as e:
                 raise RuntimeError(f"Invalid AnimateDiff stdout.\n{out2}\nError:{e}")
-
             # Stage 3: Assemble
             final_video_path = await video_generator.create_video_from_frames(
                 frame_paths=frame_paths, output_path=video_path, fps=DEFAULT_FPS, audio_path=audio_path
             )
-
             await crud.update_video_record(
                 db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_video_path
             )
             await db.commit()
             logger.info(f"TASK SUCCESS (AnimateDiff Full) for video {video_id}. Path: {final_video_path}")
-
         except Exception as e:
             logger.error(f"TASK FAILED (AnimateDiff Full) for video {video_id}: {e}", exc_info=True)
             await db.rollback()
@@ -300,8 +293,6 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
                 except Exception as e_clean: logger.error(f"Frames cleanup error: {e_clean}")
             logger.info(f"TASK FINISHED (AnimateDiff Full) for video_id={video_id}")
 
-
-
 # ---------- NEW: Semantic Orchestrator ----------
 async def process_semantic_video_generation(video_id: int):
     """
@@ -317,21 +308,31 @@ async def process_semantic_video_generation(video_id: int):
       - animate_diff_engine.py -> {"status":"COMPLETED","frame_paths":[...]}
     """
     logger.info(f"ORCHESTRATOR START video_id={video_id}")
-
     audio_path: Optional[str] = None
     timestamps_path: Optional[str] = None
     final_video_path: Optional[str] = None
     scene_temp_dirs: List[str] = []
     all_frame_paths: List[str] = []
-
     async with AsyncSessionLocal() as db:
         try:
             video_record = await crud.get_video(db, video_id=video_id)
             if not video_record:
                 raise FileNotFoundError(f"Video {video_id} not found.")
 
-            await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
+            # INITIAL STATUS
+            video_record.status = models.VideoStatus.PROCESSING
+            video_record.progress = 0.0
+            await db.merge(video_record)
             await db.commit()
+
+            # ---------- PROGRESS HELPER ----------
+            async def update_progress(percent: float, step_name: str):
+                video_record.progress = round(percent, 1)
+                video_record.status = f"PROCESSING: {step_name}"
+                await db.merge(video_record)
+                await db.commit()
+                logger.info(f"Progress: {video_record.progress}% - {step_name}")
+            # -------------------------------------------------
 
             quote_text = video_record.quote.text
             uid = uuid.uuid4()
@@ -340,7 +341,6 @@ async def process_semantic_video_generation(video_id: int):
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_audio_{uid}.mp3")
             speech_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
             speech_cmd = [sys.executable, speech_script, "--text", quote_text, "--output-path", audio_path]
-
             logger.info("ORCH: Running SpeechT5 (audio + timestamps)...")
             rc, out, err = await run_subprocess_streamed(
                 speech_cmd, timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
@@ -355,19 +355,20 @@ async def process_semantic_video_generation(video_id: int):
             except Exception as e:
                 raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
 
+            # Stage 1: Audio done → 20%
+            await update_progress(20.0, "Audio generated")
+
             # ---------- 2) Storyboard (with durations) ----------
             storyboard_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "storyboard_engine.py")
             storyboard_cmd = [sys.executable, storyboard_script, "--quote", quote_text]
             if timestamps_path and os.path.exists(timestamps_path):
                 storyboard_cmd += ["--timestamps", timestamps_path]
-
             logger.info("ORCH: Running Storyboard engine...")
             rc2, out2, err2 = await run_subprocess_streamed(
                 storyboard_cmd, timeout=STORYBOARD_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
             )
             if rc2 != 0:
                 raise RuntimeError(f"storyboard_engine.py failed (rc={rc2}). Stderr:\n{err2}")
-
             try:
                 sb_json = json.loads(out2)
                 if sb_json.get("status") != "COMPLETED":
@@ -378,6 +379,8 @@ async def process_semantic_video_generation(video_id: int):
             except Exception as e:
                 raise RuntimeError(f"Invalid storyboard stdout.\n{out2}\nError:{e}")
 
+            # Stage 2: Storyboard done → 40%
+            await update_progress(40.0, "Storyboard created")
 
             # ---------- 3) Per-scene AnimateDiff ----------
             ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
@@ -387,9 +390,8 @@ async def process_semantic_video_generation(video_id: int):
                     raise ValueError(f"Scene {idx} has no 'animation_prompt'.")
                 frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"scene_{idx}_{uuid.uuid4().hex}")
                 scene_temp_dirs.append(frames_dir)
-
                 logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → AnimateDiff")
-                
+               
                 # === THE ONLY CHANGE IS HERE: Golden Configuration Applied ===
                 ad_cmd = [
                     sys.executable,
@@ -399,13 +401,11 @@ async def process_semantic_video_generation(video_id: int):
                     "--num-steps", "4",
                     "--guidance-scale", "1.5"
                 ]
-
                 rc3, out3, err3 = await run_subprocess_streamed(
                     ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
                 )
                 if rc3 != 0:
                     raise RuntimeError(f"animate_diff_engine.py failed (scene {idx}) rc={rc3}. Stderr:\n{err3}")
-
                 try:
                     ad_json = json.loads(out3)
                     if ad_json.get("status") != "COMPLETED":
@@ -417,6 +417,9 @@ async def process_semantic_video_generation(video_id: int):
                 except Exception as e:
                     raise RuntimeError(f"Invalid AnimateDiff stdout (scene {idx}).\n{out3}\nError:{e}")
 
+            # Stage 3: All scenes done → 80%
+            await update_progress(80.0, f"Animated {len(storyboard)} scenes")
+
             # ---------- 4) Assemble final video ----------
             final_video_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_video_{uid}.mp4")
             logger.info("ORCH: Assembling final video with master audio...")
@@ -427,11 +430,21 @@ async def process_semantic_video_generation(video_id: int):
                 audio_path=audio_path,
             )
 
+            # Stage 4: Assembly done → 90%
+            await update_progress(90.0, "Video assembled")
+
             # ---------- 5) Update DB ----------
             await crud.update_video_record(
                 db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_path
             )
             await db.commit()
+
+            # Stage 5: Finalize → 100%
+            video_record.progress = 100.0
+            video_record.status = models.VideoStatus.COMPLETED
+            await db.merge(video_record)
+            await db.commit()
+
             logger.info(f"ORCHESTRATOR SUCCESS video_id={video_id}. Path: {final_path}")
 
         except Exception as e:
@@ -439,6 +452,7 @@ async def process_semantic_video_generation(video_id: int):
             await db.rollback()
             vr = await crud.get_video(db, video_id=video_id)
             if vr:
+                vr.progress = 0.0  # Reset on failure
                 await crud.update_video_record(db, video=vr, status=models.VideoStatus.FAILED, error_message=str(e))
                 await db.commit()
         finally:
@@ -451,4 +465,3 @@ async def process_semantic_video_generation(video_id: int):
                     try: shutil.rmtree(d)
                     except Exception as err: logger.error(f"Scene dir cleanup error: {err}")
             logger.info(f"ORCHESTRATOR FINISHED video_id={video_id}")
-

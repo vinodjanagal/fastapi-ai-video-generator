@@ -70,6 +70,7 @@ class Video(Base):
     views = Column(Integer, default=0)
     mood_score = Column(Float)
     generated_at = Column(DateTime(timezone=True), server_default=func.now())
+    progress = Column(Float, default=0.0, nullable=False)
     
     # Add lazy="selectin"
     quote = relationship("Quote", back_populates="videos", lazy="selectin")
