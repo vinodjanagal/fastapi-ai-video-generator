@@ -20,6 +20,7 @@ from app.schemas import SemanticVideoRequest
 from app.tasks import process_semantic_video_generation
 from arq import create_pool
 from arq.connections import RedisSettings
+from app.schemas import SemanticVideoRequest 
 
 
 
@@ -478,3 +479,5 @@ async def generate_semantic_video(
         await db.rollback()
         logger.error(f"Failed to create semantic video job: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error.")
+    
+

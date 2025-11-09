@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 from statistics import pstdev
+from PIL import Image
+import torch
+
 
 # --- DYNAMIC PYTHONPATH ---
 def _ensure_project_root_in_path():
@@ -86,6 +89,7 @@ def _looks_like_noise(im: Image.Image) -> bool:
 
 def build_animdiff_pipeline(*,
                             base_model: str,
+                            ip_adapter_image_path: Optional[str],
                             mode: str = "auto",
                             num_steps: int,
                             device: torch.device,
@@ -115,12 +119,35 @@ def build_animdiff_pipeline(*,
         lightning_path = hf_hub_download(repo_id=lightning_repo, filename=lightning_file)
          
         motion_adapter.load_state_dict(load_file(lightning_path, device="cpu"), strict=False)
+
         pipe = AnimateDiffPipeline.from_pretrained(
             base_model, motion_adapter=motion_adapter, torch_dtype=dtype
         )
         pipe.scheduler = EulerDiscreteScheduler.from_config(
             pipe.scheduler.config, timestep_spacing="leading", beta_schedule="linear", prediction_type="epsilon"
         )
+            
+        if ip_adapter_image_path:
+            logger.info("[ip_adapter] IP-Adapter is ENABLED. Loading components...")
+            try:
+                pipe.load_ip_adapter(
+                    "h94/IP-Adapter",
+                    subfolder="models",
+                    weight_name="ip-adapter_sd15.bin"
+                )
+                ip_adapter_scale = args.ip_adapter_scale  # Sensible default
+                pipe.set_ip_adapter_scale(ip_adapter_scale)
+                logger.info("[ip_adapter] IP-Adapter loaded successfully. Scale set to %f.", ip_adapter_scale)
+
+
+            except Exception as e:
+                logger.error("[ip_adapter] FAILED to load IP-Adapter. It will be disabled. Error: %s", e, exc_info=True)
+                # This ensures the pipeline doesn't crash, it just won't use the IP-Adapter
+                ip_adapter_image_path = None 
+        else:
+            logger.info("[ip_adapter] IP-Adapter is DISABLED (no --ip-adapter-image-path provided).")
+
+
     else: # Classic Mode
         logger.info(f"[classic] Loading full motion adapter from {motion_repo}")
         motion_adapter = MotionAdapter.from_pretrained(
@@ -143,19 +170,52 @@ def build_animdiff_pipeline(*,
 
 # =============== GENERATION & SAVING ===============
 
-def _run_inference(pipe: AnimateDiffPipeline, *, prompt: str, negative_prompt: str, frames: int, steps: int, guidance: float, width: int, height: int, seed: int) -> List[Image.Image]:
+def _run_inference(pipe: AnimateDiffPipeline, *, 
+                   prompt: str, 
+                   negative_prompt: str, 
+                   frames: int, 
+                   steps: int, 
+                   guidance: float, 
+                   width: int, 
+                   height: int, 
+                   ip_adapter_image_path: Optional[str],
+                   seed: int) -> List[Image.Image]:
+    
+    # --- Load the IP Adapter reference image ---
+    ip_adapter_ref_image = None
+    if ip_adapter_image_path:
+        try:
+            logger.info("Loading IP-Adapter reference image from: %s", ip_adapter_image_path)
+            ip_adapter_ref_image = Image.open(ip_adapter_image_path).convert("RGB")
+        except Exception as e:
+            logger.error("Failed to load IP-Adapter image. IP-Adapter will be inactive for this run. Error: %s", e)
+            # Ensure the variable is None if loading fails, so we fall back gracefully
+            ip_adapter_ref_image = None
+
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    # === THIS IS THE FINAL BUG FIX. THIS IS THE CORRECT CODE. ===
-    output = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        num_frames=frames,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        width=width,
-        height=height,
-        generator=generator,
-    ).frames[0]
+
+    # --- NEW, ROBUST PIPELINE CALL ---
+    # 1. Create a dictionary of arguments that are always present.
+    pipeline_kwargs = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "num_frames": frames,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+        "width": width,
+        "height": height,
+        "generator": generator,
+    }
+
+    # 2. Only add the ip_adapter_image argument if the image was successfully loaded.
+    #    This prevents us from ever passing 'ip_adapter_image=None' to the pipeline.
+    if ip_adapter_ref_image is not None:
+        pipeline_kwargs["ip_adapter_image"] = ip_adapter_ref_image
+
+    # 3. Call the pipeline by unpacking the keyword arguments dictionary.
+    output = pipe(**pipeline_kwargs).frames[0]
+    # --- END OF ROBUST CALL ---
+
     return output
 
 def _save_frames(frames: List[Image.Image], output_dir: Path, preview: bool) -> List[str]:
@@ -173,7 +233,7 @@ def _save_frames(frames: List[Image.Image], output_dir: Path, preview: bool) -> 
         paths.append(str(path))
     return paths
 
-def generate_frames(cfg: HeavyEngineConfig, *, prompt: str, negative_prompt: str, output_dir: Path, base_model: str, num_frames: int, num_steps: int, guidance_scale: float, width: int, height: int, seed: int, preview: bool, prefer_cuda_fp16: bool, fallback_sd15: bool) -> List[str]:
+def generate_frames(cfg: HeavyEngineConfig, *, prompt: str, negative_prompt: str, output_dir: Path, base_model: str, num_frames: int, num_steps: int, guidance_scale: float, ip_adapter_scale: float,width: int, height: int, seed: int, ip_adapter_image_path: Optional[str],preview: bool, prefer_cuda_fp16: bool, fallback_sd15: bool) -> List[str]:
     device, dtype = _select_device_and_dtype(prefer_cuda_fp16=prefer_cuda_fp16)
    
     eff_frames = 1 if preview else num_frames
@@ -182,7 +242,9 @@ def generate_frames(cfg: HeavyEngineConfig, *, prompt: str, negative_prompt: str
    
     pipe = build_animdiff_pipeline(
         base_model=base_model,
+        ip_adapter_image_path=ip_adapter_image_path,
         num_steps=num_steps,
+
         device=device,
         dtype=dtype,
         vae_id=getattr(cfg, "VAE_MODEL", None)
@@ -190,7 +252,7 @@ def generate_frames(cfg: HeavyEngineConfig, *, prompt: str, negative_prompt: str
    
     logger.info(f"Generating frames: frames={eff_frames}, steps={num_steps}, guidance={guidance_scale}, size={width}x{height}")
    
-    frames = _run_inference(pipe=pipe, prompt=prompt, negative_prompt=final_negative_prompt, frames=eff_frames, steps=num_steps, guidance=guidance_scale, width=width, height=height, seed=seed)
+    frames = _run_inference(pipe=pipe, prompt=prompt, negative_prompt=final_negative_prompt, frames=eff_frames, steps=num_steps, guidance=guidance_scale, width=width, height=height,ip_adapter_image_path=ip_adapter_image_path, seed=seed)
    
     if preview and fallback_sd15 and frames and _looks_like_noise(frames[0]):
         logger.warning("[quality] Preview is noise. Falling back to base_model='runwayml/stable-diffusion-v1-5'.")
@@ -210,18 +272,39 @@ def generate_frames(cfg: HeavyEngineConfig, *, prompt: str, negative_prompt: str
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="AnimateDiff Engine with Automatic Pipeline Selection")
     p.add_argument("--prompt", required=True, help="Text prompt.")
+    p.add_argument("--negative-prompt", type=str, default="", help="The negative prompt to guide the AI away from unwanted results.")
     p.add_argument("--output-dir", required=True, help="Directory to save frames.")
     p.add_argument("--base-model", default="Lykon/dreamshaper-8", help="SD1.5-compatible style model.")
     p.add_argument("--num-frames", type=int, default=16)
     p.add_argument("--num-steps", type=int, default=4)
     p.add_argument("--guidance-scale", type=float, default=1.5)
+    p.add_argument(
+    "--ip-adapter-scale", 
+    type=float, 
+    default=0.5, 
+    help="Controls the influence strength of the IP-Adapter image."
+)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--negative-prompt", type=str, default="", help="Prompt of concepts to avoid.")
     p.add_argument("--preview", action="store_true", help="Generate a single preview frame.")
     p.add_argument("--no-cuda-fp16", action="store_true", help="Force float32 on CUDA.")
     p.add_argument("--fallback-sd15", action="store_true", help="If preview is noise, retry with SD1.5 base.")
+    p.add_argument(
+    "--ip-adapter-image-path",
+    type=str,
+    default=None, # It's optional. If not provided, IP-Adapter won't be used for this run.
+    help="Path to the reference image for the IP-Adapter to maintain continuity."
+)
+    
+    p.add_argument(
+    "--foundation-embedding-path",
+    type=str,
+    default=None,
+    help="Optional: Path to a saved foundation embedding (.pt) for style consistency."
+)
+
+# -
     return p
 
 def main() -> int:
@@ -237,9 +320,11 @@ def main() -> int:
             num_frames=args.num_frames,
             num_steps=args.num_steps,
             guidance_scale=args.guidance_scale,
+            ip_adapter_scale=args.ip_adapter_scale,
             width=args.width,
             height=args.height,
             seed=args.seed,
+            ip_adapter_image_path=args.ip_adapter_image_path,
             preview=args.preview,
             prefer_cuda_fp16=(not args.no_cuda_fp16),
             fallback_sd15=bool(args.fallback_sd15)

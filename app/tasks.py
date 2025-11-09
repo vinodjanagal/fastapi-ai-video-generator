@@ -18,6 +18,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 VIDEO_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "static", "videos")
 os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
 
+# --- CONSTANTS EXTRACTED FROM YOUR ADVANCED SCRIPT ---
+BASE_QUALITY_PROMPT = "masterpiece, best quality, ultra-detailed, photorealistic, cinematic lighting, sharp focus, 8k"
+BASE_NEGATIVE_PROMPT = "nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, deformed, mutation, mutilated, extra limbs, gross proportions, malformed limbs, disfigured face, ugly"
+
 # ---------- Tunables ----------
 SPEECH_TIMEOUT = 86_400     # 24h
 AD_FRAME_TIMEOUT = 86_400   # 24h
@@ -427,24 +431,59 @@ async def process_semantic_video_generation(video_id: int):
             await update_progress(40.0, "Storyboard created")
 
             # ---------- 3) Per-scene AnimateDiff ----------
+
             ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
+
+            last_successful_frame_path: Optional[str] = None
+
             for idx, scene in enumerate(storyboard, start=1):
-                prompt = scene.get("animation_prompt")
-                if not prompt:
-                    raise ValueError(f"Scene {idx} has no 'animation_prompt'.")
+                description = scene.get("description")
+                composition = scene.get("composition")
+
+                if not description or not composition:
+                    raise ValueError(f"Scene {idx} from storyboard is missing 'description' or 'composition'.")
+                
+                # --- YOUR ADVANCED PROMPT ASSEMBLY LOGIC ---
+                # 1. Assemble the core positive prompt from the storyboard
+                positive_prompt = description
+                if isinstance(composition, dict):
+                    # Assemble in a deliberate order: camera, subject, environment, lighting, style
+                    positive_prompt += f", {composition.get('camera', '')}"
+                    positive_prompt += f", {composition.get('environment', '')}"
+                    positive_prompt += f", {composition.get('lighting', '')}"
+                    positive_prompt += f", {composition.get('style', '')}"
+                elif isinstance(composition, str):
+                    logger.warning(f"Scene {idx}: Using string fallback for composition.")
+                    positive_prompt += f", {composition}"
+
+                # 2. Inject the powerful quality keywords
+                final_positive_prompt = f"{positive_prompt}, {BASE_QUALITY_PROMPT}"
+
+                # 3. For now, we use the powerful base negative prompt directly.
+                final_negative_prompt = BASE_NEGATIVE_PROMPT
+                # --------------------------------------------
+
+                logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → POSITIVE PROMPT: '{final_positive_prompt}'")
+                logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → NEGATIVE PROMPT: '{final_negative_prompt}'")
+                
                 frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"scene_{idx}_{uuid.uuid4().hex}")
                 scene_temp_dirs.append(frames_dir)
-                logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → AnimateDiff")
-               
-                # === THE ONLY CHANGE IS HERE: Golden Configuration Applied ===
+                
+                # 4. Build the new command with the negative prompt
                 ad_cmd = [
                     sys.executable,
                     ad_script,
-                    "--prompt", prompt,
+                    "--prompt", final_positive_prompt,
+                    "--negative-prompt", final_negative_prompt, # <<<--- NEW ARGUMENT
                     "--output-dir", frames_dir,
                     "--num-steps", "4",
                     "--guidance-scale", "1.5"
                 ]
+
+                if last_successful_frame_path:
+                        ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path])
+                        logger.info(f"Using IP-Adapter with reference frame: {last_successful_frame_path}")
+                            
                 rc3, out3, err3 = await run_subprocess_streamed(
                     ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
                 )
@@ -458,7 +497,11 @@ async def process_semantic_video_generation(video_id: int):
                     if not frame_paths:
                         raise ValueError(f"AnimateDiff scene {idx} returned no frames.")
                     all_frame_paths.extend(frame_paths)
+
+                    last_successful_frame_path = frame_paths[-1] 
+
                 except Exception as e:
+                    last_successful_frame_path = None
                     raise RuntimeError(f"Invalid AnimateDiff stdout (scene {idx}).\n{out3}\nError:{e}")
 
             # Stage 3: All scenes done → 80%

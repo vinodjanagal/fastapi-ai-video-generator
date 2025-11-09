@@ -63,24 +63,37 @@ def generate_storyboard(quote_text: str, timestamp_data: Optional[List[Dict]] = 
     model_name = pick_available_model(client)
 
     # === THIS IS THE ONLY CHANGE: A more robust prompt and parsing logic ===
-    system_prompt = """
-    You are a creative director. Break the quote into 2-4 visual scenes.
-    Return ONLY JSON, formatted as a single object with a "scenes" key containing a list of scene objects.
 
-    Example Format:
+    system_prompt = """
+    You are an AI Film Director and a master of concise Stable Diffusion prompts. Your job is to create a visual storyboard for a quote by breaking it down into 2-3 concrete, cinematic scenes.
+
+    **CRITICAL RULES:**
+    1.  **METAPHORS FIRST:** Translate the abstract quote into a concrete visual metaphor.
+        -   **INSTEAD OF:** "A figure of hope."
+        -   **USE:** "A green sprout pushes through cracked earth."
+
+    2.  **TOKEN EFFICIENCY IS KEY:** The final `animation_prompt` MUST be a comma-separated list of keywords and short phrases. It should be rich but concise. The underlying AI has a hard limit of around 77 tokens.
+        -   **BAD (Too long):** "This is a cinematic shot of a lone wolf that is standing on a very tall, snowy mountain peak right at the moment the sun is rising, which creates an epic and beautiful lighting effect. The style should be photorealistic and rendered in 8k."
+        -   **GOOD (Token-Efficient):** "lone wolf on snowy mountain peak at sunrise, cinematic, epic lighting, photorealistic, sharp focus, 8k"
+
+    3.  **STRUCTURED COMPOSITION:** For each scene, you must define the `camera`, `lighting`, `style`, and `environment` using this efficient keyword style.
+
+    4.  **JSON OUTPUT ONLY:** Return ONLY a single, valid JSON object in this exact format. Do not add commentary.
+
+    **EXAMPLE JSON FORMAT:**
     {
-      "scenes": [
-        {"scene_description": "...", "animation_prompt": "..."},
-        {"scene_description": "...", "animation_prompt": "..."}
-      ]
+    "scenes": [
+        {
+        "description": "A climber's hand slips on a wet rock, but finds a new grip.",
+        "composition": {
+            "camera": "low-angle close-up, hand on rock face",
+            "lighting": "dramatic morning sun, long shadows",
+            "environment": "rugged granite cliff, clouds below",
+            "style": "photorealistic, cinematic, sharp focus, award-winning photography, 8k"
+        }
+        }
+    ]
     }
-    
-    Rules:
-    - The root of the response MUST be a JSON object.
-    - The object MUST have a key named "scenes".
-    - The value of "scenes" MUST be a JSON array.
-    - Prompts must be visual and cinematic. Do not include text in the image descriptions.
-    - Provide no commentary or text outside the single JSON object.
     """
 
     logger.info("🚀 Requesting Groq for storyboard...")
