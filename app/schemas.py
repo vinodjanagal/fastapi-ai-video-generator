@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import List, Optional
 from . import models
 
@@ -63,8 +63,6 @@ class VideoGenerateRequest(BaseModel):
     quote_id: int = Field(..., gt=0)
     style: Optional[str] = Field(default="dark_gradient", description="Format: voice:style")
 
-class SemanticVideoRequest(BaseModel):
-    quote_id: int = Field(..., gt=0)
 
 class VideoAcceptedResponse(BaseModel):
     video_id: int
@@ -78,3 +76,33 @@ class VideoStatusResponse(BaseModel):
     error_message: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
+
+class SemanticVideoRequest(BaseModel):
+    # The user can provide a quote_id. It's optional.
+    quote_id: Optional[int] = Field(None, description="The ID of an existing quote to generate a video for.")
+    
+    # Or, the user can provide new text and an author.
+    quote_text: Optional[str] = Field(None, description="The text of a new quote to create and generate a video for.")
+    author_name: Optional[str] = Field(None, description="The name of the author for the new quote.")
+
+    # This is a powerful Pydantic feature. It's a custom validator that checks the whole model at once.
+    @model_validator(mode='before')
+    def check_exclusive_fields(cls, values):
+        # Get the values for our key fields
+        id_present = 'quote_id' in values and values['quote_id'] is not None
+        text_present = 'quote_text' in values and values['quote_text'] is not None
+
+        # RULE 1: If both are present, it's an error.
+        if id_present and text_present:
+            raise ValueError("Provide either 'quote_id' or 'quote_text', but not both.")
+        
+        # RULE 2: If neither is present, it's an error.
+        if not id_present and not text_present:
+            raise ValueError("You must provide either 'quote_id' or 'quote_text'.")
+        
+        # RULE 3: If text is present, the author must also be present.
+        if text_present and ('author_name' not in values or not values['author_name']):
+            raise ValueError("'author_name' is required when providing 'quote_text'.")
+        
+        # If all rules pass, return the values.
+        return values

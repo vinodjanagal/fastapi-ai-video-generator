@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
-from typing import List
+from typing import List,Optional
 import logging
 from contextlib import asynccontextmanager
 from app.database import engine, get_db, lifespan
@@ -16,7 +16,7 @@ from . import video_generator
 from app.tasks import process_video_generation
 from fastapi.responses import JSONResponse
 from app.tasks import process_video_generation, process_video_generation_speecht5, process_video_generation_animatediff
-
+from app.schemas import SemanticVideoRequest
 from app.tasks import process_semantic_video_generation
 from arq import create_pool
 from arq.connections import RedisSettings
@@ -336,6 +336,7 @@ async def get_video_status_endpoint(video_id: int, db: AsyncSession = Depends(ge
     response_data = {
         "id": db_video.id,
         "status": db_video.status,
+        "progress": db_video.progress,
         "video_url": None, # Start with null
         "error_message": db_video.error_message
     }
@@ -411,35 +412,69 @@ async def test_audio_job_endpoint():
 
 
 
-class SemanticVideoRequest(BaseModel):
-    quote_id: int
-
-@app.post("/generate-semantic-video/", response_model=schemas.VideoAcceptedResponse, status_code=202)
-async def generate_semantic_video_endpoint(request: SemanticVideoRequest, db: AsyncSession = Depends(get_db)):
+@app.post(
+    "/video/semantic/",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Create and enqueue a semantic AI video generation job",
+    response_description="Confirmation that the video generation job has been enqueued."
+)
+async def generate_semantic_video(
+    request: SemanticVideoRequest,
+    db: AsyncSession = Depends(get_db)
+    
+):
     """
-    Triggers the FULL Semantic Pipeline:
-    1. Generate audio (SpeechT5)
-    2. Generate timestamp JSON
-    3. Generate storyboard via LLM (Groq API)
-    4. Calculate scene durations
-    5. Call AnimateDiff per scene
-    6. Assemble final video
+    Enqueues a job to generate a semantic video from either an existing quote_id or new text.
+    This operation is a single atomic database transaction.
     """
-    logger.info(f"Semantic video requested for quote_id: {request.quote_id}")
+    try:
+        target_quote: Optional[models.Quote] = None
 
-    quote = await crud.get_quote(db, quote_id=request.quote_id)
-    if not quote:
-        raise HTTPException(status_code=404, detail="Quote not found")
+        # --- STEP 1: RESOLVE THE QUOTE ---
+        if request.quote_id:
+            logger.info(f"Received video request for existing quote_id={request.quote_id}")
+            target_quote = await crud.get_quote(db, quote_id=request.quote_id)
+            if not target_quote:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Quote with id {request.quote_id} not found."
+                )
+        elif request.quote_text and request.author_name:
+            logger.info(f"Received video request for new quote text: '{request.quote_text[:50]}...'")
+            quote_to_create = schemas.QuoteCreate(
+                text=request.quote_text,
+                author_name=request.author_name
+            )
+            # This function STAGES the quote for creation but does NOT commit.
+            target_quote = await crud.create_quote(db, quote=quote_to_create)
 
-    new_video = await crud.create_video_record(db, quote_id=request.quote_id)
-    await db.commit()
-    await db.refresh(new_video)
+        if not target_quote:
+            raise HTTPException(status_code=400, detail="Could not find or create a target quote.")
 
-    logger.info(f"Enqueuing semantic pipeline for video_id={new_video.id} in ARQ")
-    await redis.enqueue_job("generate_semantic_video_task", new_video.id)
+        # --- STEP 2: CREATE THE VIDEO RECORD ---
+        # This function STAGES the video record for creation but does NOT commit.
+        new_video = await crud.create_video_record(db=db, quote_id=target_quote.id)
+        
+        # --- STEP 3: COMMIT THE TRANSACTION ---
+        # This single commit will atomically save the new quote, the new author (if any),
+        # AND the new video record all at once.
+        await db.commit()
+        
+        # --- STEP 4: REFRESH THE OBJECT ---
+        # NOW the new_video object is persistent and has an ID. This call will succeed.
+        await db.refresh(new_video)
 
-    return {
-        "video_id": new_video.id,
-        "status_url": f"/videos/{new_video.id}",
-        "message": "Semantic pipeline started (this will take a long time)."
-    }
+        # --- STEP 5: ENQUEUE THE JOB ---
+        logger.info(f"Enqueuing semantic pipeline for video_id={new_video.id} linked to quote_id={target_quote.id}")
+        await redis.enqueue_job("generate_semantic_video_task", new_video.id)
+
+        return {
+            "message": "Semantic video generation has been enqueued.",
+            "video_id": new_video.id,
+            "quote_id": target_quote.id
+        }
+    except Exception as e:
+        # If anything fails before the commit, this rollback clears the session.
+        await db.rollback()
+        logger.error(f"Failed to create semantic video job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error.")
