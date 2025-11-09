@@ -153,9 +153,13 @@ def generate_audio(
     logger.info(f"Generated audio for voice '{voice_name}' (ID {speaker_id}): {output_path.name} ({duration:.2f}s)")
     return str(output_path), duration
 
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SpeechT5 Audio Generation Engine")
-    parser.add_argument("--text", type=str, required=True)
+    # Make --text NOT required
+    parser.add_argument("--text", type=str, help="Text to synthesize.")
+    parser.add_argument("--text-file", type=str, help="Path to a text file to read for synthesis.")
     parser.add_argument("--output-path", type=str, required=True)
     parser.add_argument(
         "--voice", type=str, default="nova", choices=list(SPEAKER_VOICES.keys())
@@ -163,12 +167,26 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cpu")
     
     args = parser.parse_args()
+
+    # --- THIS IS THE CRITICAL LOGIC ---
+    text_to_synthesize = ""
+    if args.text_file and os.path.exists(args.text_file):
+        with open(args.text_file, 'r', encoding='utf-8') as f:
+            text_to_synthesize = f.read()
+    elif args.text:
+        text_to_synthesize = args.text
+    else:
+        # If neither is provided, exit with an error
+        logger.critical("Error: You must provide either --text or a valid --text-file.")
+        print(json.dumps({"status": "FAILED", "error": "No text input provided."}))
+        sys.exit(1)
     
+
     try:
         initialize_models(args.device)
-        # This call now correctly matches the function definition
+        # Now we use the new variable that is guaranteed to have the text
         final_path, duration = generate_audio(
-            text=args.text,
+            text=text_to_synthesize,
             output_path=Path(args.output_path),
             voice_name=args.voice 
         )

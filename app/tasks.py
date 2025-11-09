@@ -5,6 +5,7 @@ import uuid
 import shutil
 import logging
 import asyncio
+import tempfile
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy import Float
 from app.database import AsyncSessionLocal
@@ -50,7 +51,7 @@ async def run_subprocess_streamed(
                 break
             text = line.decode(errors="ignore")
             sink.append(text)
-            log_fn(text.rstrip("\n"))
+            logger.debug(text.rstrip("\n"))
     try:
         await asyncio.wait_for(
             asyncio.gather(
@@ -83,22 +84,33 @@ async def process_video_generation(video_id: int, style: str):
             video_record.progress = 0.0
             await db.merge(video_record)
             await db.commit()
+
+
             # ---------- PROGRESS HELPER ----------
             async def update_progress(percent: float, step_name: str):
                 video_record.progress = round(percent, 1)
                 video_record.status = f"PROCESSING: {step_name}"
                 await db.merge(video_record)
                 await db.commit()
-                logger.info(f"Progress: {video_record.progress}% - {step_name}")
+
+                bar = "█" * int(percent // 10) + "░" * (10 - int(percent // 10))
+                # Log the new, clean format
+                logger.info(f"PROGRESS: [{bar}] {percent:.1f}% - {step_name}")
+
+
             await crud.update_video_record(db, video=video_record, status=models.VideoStatus.PROCESSING)
             await db.commit()
+
             quote = video_record.quote
             uid = uuid.uuid4()
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp3")
             video_path = os.path.join(VIDEO_OUTPUT_DIR, f"quote_{quote.id}_{uid}.mp4")
             logger.info(f"Generating audio -> {audio_path}")
+
+
             await audio_generator.generate_audio_from_text(text=quote.text, output_filename=audio_path)
             logger.info(f"Generating video -> {video_path}")
+
             final_video_path = await video_generator.create_typography_video(
                 audio_path=audio_path,
                 text=quote.text,
@@ -215,17 +227,24 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
 
             quote_text = video_record.quote.text
             uid = uuid.uuid4()
+
             # ---------- PROGRESS HELPER ----------
             async def update_progress(percent: float, step_name: str):
                 video_record.progress = round(percent, 1)
                 video_record.status = f"PROCESSING: {step_name}"
                 await db.merge(video_record)
                 await db.commit()
-                logger.info(f"Progress: {video_record.progress}% - {step_name}")
+
+                bar = "█" * int(percent // 10) + "░" * (10 - int(percent // 10))
+                # Log the new, clean format
+                logger.info(f"PROGRESS: [{bar}] {percent:.1f}% - {step_name}")
+
+
             # -------------------------------------------------
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"audio_{uid}.mp3")
             video_path = os.path.join(VIDEO_OUTPUT_DIR, f"video_{uid}.mp4")
             frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"frames_{uid}")
+
             # Stage 1: Speech
             audio_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
             rc, out, err = await run_subprocess_streamed(
@@ -318,6 +337,11 @@ async def process_semantic_video_generation(video_id: int):
             video_record = await crud.get_video(db, video_id=video_id)
             if not video_record:
                 raise FileNotFoundError(f"Video {video_id} not found.")
+            
+            # Get the quote text to use in our logs.
+            quote_text_for_logging = video_record.quote.text
+            # log the quote text at the very beginning
+            logger.info(f"STARTING JOB FOR QUOTE: \"{quote_text_for_logging}\"")
 
             # INITIAL STATUS
             video_record.status = models.VideoStatus.PROCESSING
@@ -331,7 +355,11 @@ async def process_semantic_video_generation(video_id: int):
                 video_record.status = f"PROCESSING: {step_name}"
                 await db.merge(video_record)
                 await db.commit()
-                logger.info(f"Progress: {video_record.progress}% - {step_name}")
+
+                bar = "█" * int(percent // 10) + "░" * (10 - int(percent // 10))
+                # Log the new, clean format
+                logger.info(f"PROGRESS: [{bar}] {percent:.1f}% - {step_name}")
+                
             # -------------------------------------------------
 
             quote_text = video_record.quote.text
@@ -340,20 +368,36 @@ async def process_semantic_video_generation(video_id: int):
             # ---------- 1) Speech (master audio + timestamps) ----------
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_audio_{uid}.mp3")
             speech_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
-            speech_cmd = [sys.executable, speech_script, "--text", quote_text, "--output-path", audio_path]
-            logger.info("ORCH: Running SpeechT5 (audio + timestamps)...")
-            rc, out, err = await run_subprocess_streamed(
-                speech_cmd, timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
-            )
-            if rc != 0:
-                raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
+
+            # Create a temporary file to hold the quote text
+            text_file = None
+
             try:
-                speech_json = json.loads(out)
-                if speech_json.get("status") != "COMPLETED":
-                    raise ValueError(speech_json.get("error", "Speech engine error"))
-                timestamps_path = speech_json.get("timestamps_file")  # optional
-            except Exception as e:
-                raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
+                with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt", encoding='utf-8') as text_file:
+                    text_file.write(quote_text)
+                    text_file_path = text_file.name
+
+                speech_cmd = [sys.executable, speech_script, "--text-file", text_file_path, "--output-path", audio_path]
+                logger.info("ORCH: Running SpeechT5 (audio + timestamps)...")
+                rc, out, err = await run_subprocess_streamed(
+                    speech_cmd, timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
+                )
+                if rc != 0:
+                    raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
+                try:
+                    speech_json = json.loads(out)
+                    if speech_json.get("status") != "COMPLETED":
+                        raise ValueError(speech_json.get("error", "Speech engine error"))
+                    timestamps_path = speech_json.get("timestamps_file")  # optional
+                except Exception as e:
+                    raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
+
+            finally:
+                # CRITICAL: Clean up the temporary file no matter what happens
+                if text_file and os.path.exists(text_file.name):
+                    os.remove(text_file.name)
+
+
 
             # Stage 1: Audio done → 20%
             await update_progress(20.0, "Audio generated")
@@ -383,7 +427,7 @@ async def process_semantic_video_generation(video_id: int):
             await update_progress(40.0, "Storyboard created")
 
             # ---------- 3) Per-scene AnimateDiff ----------
-            ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
+            ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "mock_animate_diff_engine.py")
             for idx, scene in enumerate(storyboard, start=1):
                 prompt = scene.get("animation_prompt")
                 if not prompt:
