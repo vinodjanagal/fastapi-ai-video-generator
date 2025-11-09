@@ -427,7 +427,7 @@ async def process_semantic_video_generation(video_id: int):
             await update_progress(40.0, "Storyboard created")
 
             # ---------- 3) Per-scene AnimateDiff ----------
-            ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "mock_animate_diff_engine.py")
+            ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
             for idx, scene in enumerate(storyboard, start=1):
                 prompt = scene.get("animation_prompt")
                 if not prompt:
