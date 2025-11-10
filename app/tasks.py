@@ -29,6 +29,9 @@ STORYBOARD_TIMEOUT = 86_400 # 5m is plenty for LLM call via CLI wrapper
 TIMESTAMPS_TIMEOUT = 86_400 # 10m if you later split timestamps engine out
 DEFAULT_FPS = 8
 
+V2_CLASSIC_STEPS = 12
+V2_CLASSIC_GUIDANCE = 7.5
+
 # ---------- Async subprocess helper (non-blocking, streamed logs) ----------
 async def run_subprocess_streamed(
     cmd: List[str],
@@ -264,7 +267,7 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
             except Exception as e:
                 raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
             # Stage 2: Frames
-            frame_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
+            frame_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "mock_animate_diff_engine.py")
            
             # === THE ONLY CHANGE IS HERE: Golden Configuration Applied ===
             frame_cmd = [
@@ -436,36 +439,32 @@ async def process_semantic_video_generation(video_id: int):
 
             last_successful_frame_path: Optional[str] = None
 
+
             for idx, scene in enumerate(storyboard, start=1):
                 description = scene.get("description")
                 composition = scene.get("composition")
 
                 if not description or not composition:
-                    raise ValueError(f"Scene {idx} from storyboard is missing 'description' or 'composition'.")
-                
-                # --- YOUR ADVANCED PROMPT ASSEMBLY LOGIC ---
-                # 1. Assemble the core positive prompt from the storyboard
-                positive_prompt = description
+                    raise ValueError(f"Scene {idx} is missing 'description' or 'composition'")
+
+                # ✅ FIX: Make prompt sentences natural for the LDM parser
                 if isinstance(composition, dict):
-                    # Assemble in a deliberate order: camera, subject, environment, lighting, style
-                    positive_prompt += f", {composition.get('camera', '')}"
-                    positive_prompt += f", {composition.get('environment', '')}"
-                    positive_prompt += f", {composition.get('lighting', '')}"
-                    positive_prompt += f", {composition.get('style', '')}"
-                elif isinstance(composition, str):
-                    logger.warning(f"Scene {idx}: Using string fallback for composition.")
-                    positive_prompt += f", {composition}"
+                    final_positive_prompt = (
+                        f"{description}. "
+                        f"{composition.get('camera', '')}. "
+                        f"Scene set in {composition.get('environment', '')}, "
+                        f"with {composition.get('lighting', '')} lighting. "
+                        f"Visual style: {composition.get('style', '')}. "
+                        f"{BASE_QUALITY_PROMPT}"
+                    )
+                else:
+                    final_positive_prompt = f"{description}, {composition}, {BASE_QUALITY_PROMPT}"
 
-                # 2. Inject the powerful quality keywords
-                final_positive_prompt = f"{positive_prompt}, {BASE_QUALITY_PROMPT}"
-
-                # 3. For now, we use the powerful base negative prompt directly.
                 final_negative_prompt = BASE_NEGATIVE_PROMPT
-                # --------------------------------------------
 
-                logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → POSITIVE PROMPT: '{final_positive_prompt}'")
-                logger.info(f"ORCH: Scene {idx}/{len(storyboard)} → NEGATIVE PROMPT: '{final_negative_prompt}'")
-                
+                logger.info(f"[Scene {idx}] POSITIVE PROMPT: {final_positive_prompt}")
+                logger.info(f"[Scene {idx}] NEGATIVE PROMPT: {final_negative_prompt}")
+
                 frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"scene_{idx}_{uuid.uuid4().hex}")
                 scene_temp_dirs.append(frames_dir)
                 
@@ -476,33 +475,37 @@ async def process_semantic_video_generation(video_id: int):
                     "--prompt", final_positive_prompt,
                     "--negative-prompt", final_negative_prompt, # <<<--- NEW ARGUMENT
                     "--output-dir", frames_dir,
-                    "--num-steps", "4",
-                    "--guidance-scale", "1.5"
+                    "--base-model", "Lykon/dreamshaper-8",
+                    "--num-steps", str(V2_CLASSIC_STEPS),
+                    "--guidance-scale", str(V2_CLASSIC_GUIDANCE),
+                    "--mode", "classic" 
                 ]
 
                 if last_successful_frame_path:
-                        ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path])
-                        logger.info(f"Using IP-Adapter with reference frame: {last_successful_frame_path}")
-                            
-                rc3, out3, err3 = await run_subprocess_streamed(
-                    ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
-                )
+                    ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path])
+                    logger.info(f"[Scene {idx}] Using IP reference: {last_successful_frame_path}")
+
+                rc3, out3, err3 = await run_subprocess_streamed(ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT)
                 if rc3 != 0:
                     raise RuntimeError(f"animate_diff_engine.py failed (scene {idx}) rc={rc3}. Stderr:\n{err3}")
+
                 try:
                     ad_json = json.loads(out3)
                     if ad_json.get("status") != "COMPLETED":
                         raise ValueError(ad_json.get("error", f"AnimateDiff scene {idx} error"))
+
                     frame_paths = ad_json.get("frame_paths", [])
                     if not frame_paths:
-                        raise ValueError(f"AnimateDiff scene {idx} returned no frames.")
+                        raise ValueError(f"No frames returned for scene {idx}")
+
                     all_frame_paths.extend(frame_paths)
 
-                    last_successful_frame_path = frame_paths[-1] 
+                    # ✅ FIX: Use mid-frame for continuity (better visual stability)
+                    last_successful_frame_path = frame_paths[len(frame_paths) // 2]
 
                 except Exception as e:
                     last_successful_frame_path = None
-                    raise RuntimeError(f"Invalid AnimateDiff stdout (scene {idx}).\n{out3}\nError:{e}")
+                    raise RuntimeError(f"Invalid AnimateDiff output (scene {idx}). Error: {e}")
 
             # Stage 3: All scenes done → 80%
             await update_progress(80.0, f"Animated {len(storyboard)} scenes")

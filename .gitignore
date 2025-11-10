@@ -58,3 +58,12 @@ python/"python/"
 test_output*/
 reference_image.jpg
 reference_image.png
+
+# Ignore test assets
+*.jpeg
+*.jpg
+*.png
+
+# Ignore debug and output folders
+debug/
+test_output*/
