@@ -29,8 +29,9 @@ STORYBOARD_TIMEOUT = 86_400 # 5m is plenty for LLM call via CLI wrapper
 TIMESTAMPS_TIMEOUT = 86_400 # 10m if you later split timestamps engine out
 DEFAULT_FPS = 8
 
-V2_CLASSIC_STEPS = 12
-V2_CLASSIC_GUIDANCE = 7.5
+V2_CLASSIC_STEPS = 20
+V2_CLASSIC_GUIDANCE = 6.0
+V2_IP_ADAPTER_SCALE = 0.12
 
 # ---------- Async subprocess helper (non-blocking, streamed logs) ----------
 async def run_subprocess_streamed(
@@ -476,15 +477,19 @@ async def process_semantic_video_generation(video_id: int):
                     "--prompt", final_positive_prompt,
                     "--negative-prompt", final_negative_prompt, # <<<--- NEW ARGUMENT
                     "--output-dir", frames_dir,
-                    "--base-model", "runwayml/stable-diffusion-v1-5",
+                    "--base-model", "SG161222/Realistic_Vision_V5.1_noVAE",
                     "--num-steps", str(V2_CLASSIC_STEPS),
                     "--guidance-scale", str(V2_CLASSIC_GUIDANCE),
                     "--mode", "classic" 
                 ]
 
                 if last_successful_frame_path:
-                    ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path])
+                    ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path,
+                                   "--ip-adapter-scale", str(V2_IP_ADAPTER_SCALE)
+                                ])
                     logger.info(f"[Scene {idx}] Using IP reference: {last_successful_frame_path}")
+
+                    
 
                 rc3, out3, err3 = await run_subprocess_streamed(ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT)
                 if rc3 != 0:
