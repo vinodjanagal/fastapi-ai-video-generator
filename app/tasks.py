@@ -407,6 +407,7 @@ async def process_semantic_video_generation(video_id: int):
 
 
             # Stage 1: Audio done → 20%
+
             await update_progress(20.0, "Audio generated")
 
             # ---------- 2) Storyboard (with durations) ----------
@@ -475,7 +476,7 @@ async def process_semantic_video_generation(video_id: int):
                     "--prompt", final_positive_prompt,
                     "--negative-prompt", final_negative_prompt, # <<<--- NEW ARGUMENT
                     "--output-dir", frames_dir,
-                    "--base-model", "Lykon/dreamshaper-8",
+                    "--base-model", "runwayml/stable-diffusion-v1-5",
                     "--num-steps", str(V2_CLASSIC_STEPS),
                     "--guidance-scale", str(V2_CLASSIC_GUIDANCE),
                     "--mode", "classic" 

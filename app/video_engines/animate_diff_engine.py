@@ -129,7 +129,7 @@ def build_pipeline(args) -> AnimateDiffPipeline:
     elif args.ip_adapter_image_path:
         logger.info("[ip_adapter] Enabled. Loading IP-Adapter model...")
         try:
-            pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name="ip-adapter_sd15.bin")
+            pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name="ip-adapter_sd15_light.bin")
             pipe.set_ip_adapter_scale(args.ip_adapter_scale)
             logger.info(f"[ip_adapter] Loaded successfully. Scale = {args.ip_adapter_scale}")
         except Exception as e:
@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-frames", type=int, default=16)
     p.add_argument("--num-steps", type=int, default=4)
     p.add_argument("--guidance-scale", type=float, default=1.5)
-    p.add_argument("--ip-adapter-scale", type=float, default=0.5)
+    p.add_argument("--ip-adapter-scale", type=float, default=0.2)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
