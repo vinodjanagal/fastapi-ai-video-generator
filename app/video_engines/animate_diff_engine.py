@@ -211,8 +211,18 @@ def run_inference(pipe: AnimateDiffPipeline, args) -> List[Image.Image]:
             )
 
     logger.info("Running AnimateDiff pipeline inference...")
-    result = pipe(**pipeline_kwargs)
-    return result.frames[0]
+
+    if args.init_image:
+        try:
+            logger.info(f"Loading init_image for compositional change: {args.init_image}")
+            init_img = Image.open(args.init_image).convert("RGB").resize((args.width, args.height))
+            pipeline_kwargs["image"] = init_img  # NOTE: The parameter is 'image', not 'init_image' for this pipeline
+            pipeline_kwargs["strength"] = args.strength
+        except Exception as e:
+            logger.error(f"Failed to load or use init_image: {e}")
+
+        result = pipe(**pipeline_kwargs)
+        return result.frames[0]
 
 def save_frames(frames: List[Image.Image], output_dir: Path) -> List[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -242,6 +252,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", type=str, default="lightning", choices=["lightning", "classic"], help="Pipeline mode: lightning for speed, classic for quality.")
     p.add_argument("--ip-adapter-image-path", type=str, default=None)
     p.add_argument("--no-cuda-fp16", action="store_true")
+    p.add_argument("--init-image", type=str, default=None)
+    p.add_argument("--strength", type=float, default=0.75) # A good starting point for significant change
     return p
 
 
