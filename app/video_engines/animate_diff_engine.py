@@ -23,6 +23,7 @@ from diffusers import (
     UNet2DConditionModel,
     EulerDiscreteScheduler,
     DDIMScheduler,
+    DPMSolverMultistepScheduler,
     AutoencoderKL,
 )
 
@@ -47,16 +48,31 @@ def _apply_memory_saving(pipe: AnimateDiffPipeline) -> None:
             getattr(pipe, fn_name)()
     pass
 
-def _maybe_swap_vae(pipe: AnimateDiffPipeline, vae_id: Optional[str], device: torch.device, dtype: torch.dtype) -> AnimateDiffPipeline:
-    """Optional VAE swap for improved image sharpness."""
+def _maybe_swap_vae(pipe, vae_id: str | None, device, dtype):
     if not vae_id:
+        logger.info("[vae] No custom VAE specified; using pipeline default.")
         return pipe
     try:
-        logger.info(f"[vae] Swapping VAE -> {vae_id}")
-        vae = AutoencoderKL.from_pretrained(vae_id, torch_dtype=dtype)
+        logger.info(f"[vae] Attempting to swap VAE -> {vae_id}")
+        try:
+            vae = AutoencoderKL.from_pretrained(vae_id, torch_dtype=dtype)
+            logger.info(f"[vae] Loaded VAE from repo: {vae_id}")
+        except Exception:
+            logger.info(f"[vae] Repo load failed; trying single-file...")
+            for fname in ["sd-vae-ft-mse-original.safetensors", "diffusion_pytorch_model.safetensors"]:
+                try:
+                    path = hf_hub_download(repo_id=vae_id.split("/")[0], filename=fname)
+                    vae = AutoencoderKL.from_single_file(path, torch_dtype=dtype)
+                    logger.info(f"[vae] Loaded VAE from single file: {path}")
+                    break
+                except:
+                    continue
+            else:
+                raise RuntimeError("VAE load failed")
         pipe.vae = vae.to(device)
+        logger.info(f"[vae] Successfully swapped VAE -> {vae_id}")
     except Exception as e:
-        logger.warning(f"[vae] VAE swap failed ({vae_id}): {e}")
+        logger.error(f"[vae] VAE swap FAILED: {e}. Using default.", exc_info=True)
     return pipe
 
 # =====================================================================
@@ -64,50 +80,29 @@ def _maybe_swap_vae(pipe: AnimateDiffPipeline, vae_id: Optional[str], device: to
 # =====================================================================
 
 def build_pipeline(args) -> AnimateDiffPipeline:
-    """Builds a fully stable AnimateDiff pipeline with correct motion adapter and scheduler."""
+    """Builds a fully stable AnimateDiff pipeline with configurable, high-quality components."""
     device, dtype = _select_device_and_dtype(prefer_cuda_fp16=not args.no_cuda_fp16)
-    num_steps = args.num_steps
-    mode = args.mode
+    
+    logger.info(f"[pipeline_builder] Mode: {args.mode}, Steps: {args.num_steps}, Base: {args.base_model}")
 
-    logger.info(f"[pipeline_builder] ✅ Mode selected: {mode} (num_steps={num_steps})")
-    logger.info(f"[pipeline_builder] Base model: {args.base_model}")
-
-    # -------------------- FIX 1: Proper Motion Adapter Load --------------------
-    if mode == "lightning":
+    # --- Step 1: Build base pipeline ---
+    if args.mode == "lightning":
         valid_steps = [1, 2, 4, 8]
+        num_steps = args.num_steps
         if num_steps not in valid_steps:
             logger.warning(f"[lightning] num_steps={num_steps} invalid. Forcing to 4.")
             num_steps = 4
-
         lightning_repo = "ByteDance/AnimateDiff-Lightning"
-        lightning_file = f"animatediff_lightning_{num_steps}step_diffusers.safetensors"
-
+        lightning_file = f"animatediff_lightning_{num_steps}step_diffusers.safensors"
         logger.info(f"[lightning] Loading UNet and motion weights...")
         unet = UNet2DConditionModel.from_pretrained(args.base_model, subfolder="unet", torch_dtype=dtype)
-
         motion_adapter_path = hf_hub_download(repo_id=lightning_repo, filename=lightning_file)
         motion_adapter_state_dict = load_file(motion_adapter_path, device="cpu")
-
-        # ✅ Correctly instantiate and load the MotionAdapter
         motion_adapter = MotionAdapter()
         motion_adapter.load_state_dict(motion_adapter_state_dict)
-        logger.info("[lightning] Motion adapter successfully loaded into memory.")
-
         pipe = AnimateDiffPipeline.from_pretrained(
-            args.base_model,
-            unet=unet,
-            motion_adapter=motion_adapter,
-            torch_dtype=dtype
+            args.base_model, unet=unet, motion_adapter=motion_adapter, torch_dtype=dtype
         )
-
-        # ✅ FIX 3: Use DDIM instead of Euler for stability and clarity
-        pipe.scheduler = DDIMScheduler.from_config(
-            pipe.scheduler.config,
-            timestep_spacing="leading",
-            beta_schedule="linear",
-            prediction_type="epsilon"
-        )
-
     else:  # CLASSIC MODE
         motion_repo = "guoyww/animatediff-motion-adapter-v1-5-2"
         logger.info(f"[classic] Loading motion adapter from {motion_repo}")
@@ -116,50 +111,54 @@ def build_pipeline(args) -> AnimateDiffPipeline:
             args.base_model, motion_adapter=motion_adapter, torch_dtype=dtype
         )
 
-        pipe.scheduler = DDIMScheduler.from_config(
-            pipe.scheduler.config,
-            timestep_spacing="leading",
-            beta_schedule="linear",
-            prediction_type="epsilon"
-        )
+    # --- Step 2: Set Scheduler with Fallback ---
+    if getattr(args, "scheduler", "DDIM") == "DPM++ 2M Karras":
+        try:
+            from diffusers import DPMSolverMultistepScheduler
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config,
+                algorithm_type="dpmsolver++",
+                use_karras_sigmas=True
+            )
+            logger.info("[scheduler] Swapped to: DPM++ 2M Karras")
+        except Exception as e:
+            logger.warning(f"[scheduler] Karras failed ({e}). Using DDIM.")
+            from diffusers import DDIMScheduler
+            pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    else:
+        from diffusers import DDIMScheduler
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+        logger.info("[scheduler] Using: DDIM")
 
-    # -------------------- FIX 2: Disable IP-Adapter in Lightning Mode --------------------
-    if mode == "lightning":
-        logger.info("[ip_adapter] Skipped — incompatible with Lightning mode to avoid over-blurring.")
-    elif args.ip_adapter_image_path:
+    # --- Step 3: Load IP-Adapter ---
+    if args.mode == "lightning":
+        logger.info("[ip_adapter] Skipped — incompatible with Lightning mode.")
+    elif getattr(args, "ip_adapter_image_path", None):
         logger.info("[ip_adapter] Enabled. Loading IP-Adapter model...")
         try:
             pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name="ip-adapter_sd15_light.bin")
-            pipe.set_ip_adapter_scale(args.ip_adapter_scale)
-            logger.info(f"[ip_adapter] Loaded successfully. Scale = {args.ip_adapter_scale}")
+            scale = getattr(args, "ip_adapter_scale", 0.05)
+            pipe.set_ip_adapter_scale(scale)
+            logger.info(f"[ip_adapter] Loaded successfully. Scale = {scale}")
         except Exception as e:
             logger.error(f"[ip_adapter] FAILED: {e}", exc_info=True)
     else:
         logger.info("[ip_adapter] Not provided — skipping.")
 
-    # Optional VAE
-    from app.video_engines.heavy_config import HeavyEngineConfig
-    pipe = _maybe_swap_vae(pipe, vae_id=getattr(HeavyEngineConfig(), "VAE_MODEL", None), device=device, dtype=dtype)
+    # --- Step 4: Swap VAE ---
+    vae_id = getattr(args, "vae", "stabilityai/sd-vae-ft-mse")
+    pipe = _maybe_swap_vae(pipe, vae_id=vae_id, device=device, dtype=dtype)
 
+    # --- Finalization ---
     _apply_memory_saving(pipe)
     pipe.to(device)
-    logger.info(f"[{mode}] ✅ AnimateDiff pipeline is ready on {device}.")
+    logger.info(f"[{args.mode}] AnimateDiff pipeline is ready on {device}.")
     return pipe
-
 
 # ======================== INFERENCE + SAVE =============================
 
-def run_inference(pipe: AnimateDiffPipeline, args) -> List[Image.Image]:
-    """
-    Run AnimateDiff inference with robust IP-Adapter handling.
-
-    Important behaviors:
-    - We only pass the `ip_adapter_image` into the pipeline call when the
-      `pipe` actually has an IP-Adapter loaded (or, more generally, the
-      internal attributes required for IP-Adapter embedding preparation).
-    - This prevents the pipeline from entering IP-Adapter code paths when
-      it was intentionally not configured (e.g., Lightning mode).
-    """
+def run_inference(pipe, args) -> List[Image.Image]:
+    """Runs AnimateDiff inference with robust, multi-modal continuity handling."""
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
     pipeline_kwargs = {
@@ -173,56 +172,40 @@ def run_inference(pipe: AnimateDiffPipeline, args) -> List[Image.Image]:
         "generator": generator,
     }
 
-    # --- Defensive IP-Adapter handling ---
-    # Only add an ip_adapter_image if:
-    #  1) the user provided a path (args.ip_adapter_image_path), AND
-    #  2) the pipeline actually appears to support IP-Adapter (pipe.ip_adapter is present),
-    #     or the UNet has 'encoder_hid_proj' with the expected attribute.
-    ip_path = getattr(args, "ip_adapter_image_path", None)
-    pipeline_supports_ip = getattr(pipe, "ip_adapter", None) is not None
+    # --- Triple-Safe Continuity Logic ---
+    has_ip_adapter = args.ip_adapter_image_path is not None and args.ip_adapter_scale > 0.0
+    has_init_image = args.init_image is not None and 0.0 < args.strength < 1.0
 
-    # Extra defensive fallback: check the unet internals which animatediff expects
-    if not pipeline_supports_ip:
+    if has_ip_adapter:
+        logger.info(f"[continuity] IP-Adapter enabled with scale: {args.ip_adapter_scale}")
         try:
-            # If unet.encoder_hid_proj exists and has image_projection_layers, pipeline likely supports IP
-            pipeline_supports_ip = bool(
-                getattr(getattr(pipe, "unet", None), "encoder_hid_proj", None) is not None
-            )
-        except Exception:
-            pipeline_supports_ip = False
+            ip_img = Image.open(args.ip_adapter_image_path).convert("RGB")
+            pipeline_kwargs["ip_adapter_image"] = ip_img
+        except Exception as e:
+            logger.error(f"[continuity] Failed to load IP-Adapter image: {e}", exc_info=True)
+            return []  # prevent crash
 
-    if ip_path:
-        if pipeline_supports_ip:
-            try:
-                logger.info(f"Loading IP-Adapter reference image: {ip_path}")
-                ip_img = Image.open(ip_path).convert("RGB")
-                pipeline_kwargs["ip_adapter_image"] = ip_img
-            except FileNotFoundError:
-                logger.warning(f"IP-Adapter reference image not found at: {ip_path} -- continuing without it.")
-            except Exception as e:
-                logger.error(f"Failed to load IP-Adapter reference image: {e} -- continuing without it.")
-        else:
-            # Important: user asked for a reference image but pipeline doesn't support IP-Adapter.
-            # We avoid passing the image to prevent NoneType attribute errors.
-            logger.warning(
-                "IP-Adapter reference image was provided, but the current pipeline "
-                "was built without an IP-Adapter (or required UNet components are missing). "
-                "Skipping ip_adapter_image to avoid runtime errors."
-            )
+    if has_init_image:
+        logger.info(f"[continuity] Init_image (img2vid) enabled with strength: {args.strength}")
+        try:
+            init_img = Image.open(args.init_image).convert("RGB").resize((args.width, args.height))
+            pipeline_kwargs["image"] = init_img
+            pipeline_kwargs["strength"] = args.strength
+        except Exception as e:
+            logger.error(f"[continuity] Failed to load init_image: {e}", exc_info=True)
+            return []  # prevent crash
 
     logger.info("Running AnimateDiff pipeline inference...")
 
-    if args.init_image:
-        try:
-            logger.info(f"Loading init_image for compositional change: {args.init_image}")
-            init_img = Image.open(args.init_image).convert("RGB").resize((args.width, args.height))
-            pipeline_kwargs["image"] = init_img  # NOTE: The parameter is 'image', not 'init_image' for this pipeline
-            pipeline_kwargs["strength"] = args.strength
-        except Exception as e:
-            logger.error(f"Failed to load or use init_image: {e}")
-
-        result = pipe(**pipeline_kwargs)
-        return result.frames[0]
+    try:
+        output = pipe(**pipeline_kwargs)
+        frames = output.frames[0]
+        logger.info(f"✅ Inference completed, {len(frames)} frames generated.")
+        return frames
+    except Exception as e:
+        logger.error(f"[inference] Pipeline execution failed: {e}", exc_info=True)
+        return []
+    
 
 def save_frames(frames: List[Image.Image], output_dir: Path) -> List[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -235,27 +218,38 @@ def save_frames(frames: List[Image.Image], output_dir: Path) -> List[str]:
 
 
 # ======================== CLI =============================
-
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="AnimateDiff Engine (Stable Production Build)")
+    p = argparse.ArgumentParser(description="AnimateDiff Engine (V2.4 Production-Locked)")
+    
+    # Core I/O
     p.add_argument("--prompt", required=True)
     p.add_argument("--negative-prompt", type=str, default="")
     p.add_argument("--output-dir", required=True)
+    
+    # Models
     p.add_argument("--base-model", default="SG161222/Realistic_Vision_V5.1_noVAE")
+    p.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse", help="VAE model ID.")
+    
+    # Generation Params
     p.add_argument("--num-frames", type=int, default=16)
-    p.add_argument("--num-steps", type=int, default=4)
-    p.add_argument("--guidance-scale", type=float, default=6.0)
-    p.add_argument("--ip-adapter-scale", type=float, default=0.12, help="IP scale (0.1-0.3 safe)")
+    p.add_argument("--num-steps", type=int, default=25)
+    p.add_argument("--guidance-scale", type=float, default=7.0)
+    p.add_argument("--scheduler", type=str, default="DPM++ 2M Karras", choices=["DPM++ 2M Karras", "DDIM"])
+    
+    # Continuity Params
+    p.add_argument("--ip-adapter-image-path", type=str, default=None)
+    p.add_argument("--ip-adapter-scale", type=float, default=0.0)
+    p.add_argument("--init-image", type=str, default=None)
+    p.add_argument("--strength", type=float, default=1.0)
+    
+    # Technical Params
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--mode", type=str, default="lightning", choices=["lightning", "classic"], help="Pipeline mode: lightning for speed, classic for quality.")
-    p.add_argument("--ip-adapter-image-path", type=str, default=None)
+    p.add_argument("--mode", type=str, default="classic", choices=["lightning", "classic"])
     p.add_argument("--no-cuda-fp16", action="store_true")
-    p.add_argument("--init-image", type=str, default=None)
-    p.add_argument("--strength", type=float, default=0.75) # A good starting point for significant change
+    
     return p
-
 
 def main() -> int:
     args = build_parser().parse_args()

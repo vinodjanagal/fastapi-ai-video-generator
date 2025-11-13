@@ -20,7 +20,7 @@ os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
 
 # --- CONSTANTS EXTRACTED FROM YOUR ADVANCED SCRIPT ---
 BASE_QUALITY_PROMPT = "masterpiece, best quality, ultra-detailed, photorealistic, cinematic lighting, sharp focus, 8k"
-BASE_NEGATIVE_PROMPT = "nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, deformed, mutation, mutilated, extra limbs, gross proportions, malformed limbs, disfigured face, ugly"
+BASE_NEGATIVE_PROMPT = "nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, deformed, mutation, mutilated, extra limbs, gross proportions, malformed limbs, disfigured face, ugly(deformed iris, deformed pupils, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime, mutated hands and fingers:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, wrong anatomy, extra limb, missing limb, floating limbs, disconnected limbs, mutation, mutated, ugly, disgusting, amputation"
 
 # ---------- Tunables ----------
 SPEECH_TIMEOUT = 86_400     # 24h
