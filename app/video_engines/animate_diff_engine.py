@@ -108,7 +108,7 @@ def _maybe_swap_vae(pipe, vae_id, device, dtype):
         logger.error(f"CRITICAL: VAE loading failed: {e}", exc_info=True); raise
     return pipe
 
-def _load_ip_adapter_safe(pipe, repo):
+def _load_ip_adapter_safe(pipe, repo, device):
     # V6.3 FIX: Prioritize the 'light' model based on validated project knowledge
     candidates = [
         ("models", "ip-adapter_sd15_light.bin"),
