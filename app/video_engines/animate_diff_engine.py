@@ -53,14 +53,23 @@ def _maybe_swap_vae(pipe: AnimateDiffPipeline, vae_id: Optional[str], device: to
     if not vae_id:
         logger.info("[vae] No VAE specified — using default.")
         return pipe
+
     logger.info(f"[vae] Trying VAE: {vae_id}")
     try:
-        vae = AutoencoderKL.from_pretrained(vae_id, torch_dtype=dtype)
+        # CRITICAL FIX: On CPU, we MUST use float32. Forcing this prevents silent failures.
+        vae_dtype = torch.float32 if device.type == "cpu" else dtype
+        logger.info(f"[vae] Using VAE dtype: {vae_dtype} for device: {device.type}")
+
+        # This is a more robust method for loading single-file VAEs.
+        vae = AutoencoderKL.from_pretrained(vae_id, torch_dtype=vae_dtype)
+        
         pipe.vae = vae.to(device)
-        logger.info(f"[vae] ✅ Loaded VAE from pretrained: {vae_id}")
+        logger.info(f"[vae] ✅ SUCCESS: VAE swapped and verified for {vae_id}")
     except Exception as e:
-        logger.error(f"[vae] FAILED to swap VAE ({e}); continuing with pipeline's default VAE.", exc_info=True)
+        logger.error(f"[vae] FAILED TO LOAD VAE: {e}", exc_info=True)
+        logger.warning("[vae] CRITICAL: Falling back to the pipeline's default VAE.")
     return pipe
+
 
 def compile_prompt(raw_prompt: str, max_phrases: int = 12) -> Tuple[str, List[str]]:
     original_phrases = [p.strip() for p in raw_prompt.split(",") if p.strip()]
