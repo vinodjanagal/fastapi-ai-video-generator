@@ -71,6 +71,8 @@ def _maybe_swap_vae(pipe: AnimateDiffPipeline, vae_id: Optional[str], device: to
     return pipe
 
 
+
+
 def compile_prompt(raw_prompt: str, max_phrases: int = 12) -> Tuple[str, List[str]]:
     original_phrases = [p.strip() for p in raw_prompt.split(",") if p.strip()]
     priority, others = [], []
@@ -107,6 +109,14 @@ def apply_shot_type_tuning(args, shot_type: str):
         args.strength, args.ip_adapter_scale, args.guidance_scale = 0.50, 0.08, 7.5
     logger.info(f"[shot-engine] Final tuned parameters -> strength={args.strength}, ip_scale={args.ip_adapter_scale}, guidance={args.guidance_scale}")
 
+
+def apply_safety_guards(args):
+    """Prevents unstable parameter combinations that can cause noise collapse."""
+    if not args.manual:
+        original_steps = args.num_steps
+        if args.num_steps < 15:
+            args.num_steps = 15
+            logger.warning(f"[safety-guard] num_steps was {original_steps}, which is too low for a stable preview. Forcing to {args.num_steps}.")
 
 # --- CORE FUNCTIONS ---
 def build_pipeline(args) -> AnimateDiffPipeline:
@@ -204,15 +214,28 @@ def main() -> int:
     try:
         full_prompt_for_classification = args.prompt 
         args.prompt, visual_tokens = compile_prompt(args.prompt)
+        logger.info(f"[main] Compiled prompt with visual tokens: {visual_tokens}")
         
         if not args.manual:
             shot_type = classify_shot_type(full_prompt_for_classification)
             apply_shot_type_tuning(args, shot_type)
+            apply_safety_guards(args)
         else:
             logger.info("[main] --manual flag detected. Skipping automated Shot-Type Engine.")
 
         pipe = build_pipeline(args)
         frames = run_inference(pipe, args)
+
+        if not frames:
+            raise RuntimeError("Inference returned no frames. Check logs for details.")
+
+        # --- INTEGRATION: Save a first-frame preview for fast feedback ---
+        if frames:
+            preview_path = Path(args.output_dir) / "preview_frame_0000.png"
+            frames[0].save(preview_path)
+            logger.info(f"[preview] First-frame preview saved to: {preview_path}")
+        # --- END INTEGRATION ---
+
         paths = save_frames(frames, Path(args.output_dir))
         print(json.dumps({"status": "COMPLETED", "frame_paths": paths}))
         
