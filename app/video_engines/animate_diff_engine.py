@@ -30,14 +30,15 @@ except IOError:
 def semantic_parser(prompt: str) -> dict:
     doc = NLP(prompt)
     subject, action, obj, environment = None, None, None, None
+    dobj_token = None
+    # V6.3 FIX: More robust parsing logic
     for token in doc:
         if subject is None and token.dep_ == "nsubj" and token.pos_ in ("NOUN", "PROPN"): subject = token.text
         if action is None and token.pos_ == "VERB": action = token.lemma_
-        if obj is None and token.dep_ == "dobj": obj = token.text
-    # V6.2 FIX: Fallback for objects in prepositional phrases
-    if obj is None:
-        for token in doc:
-            if token.dep_ == "pobj" and token.pos_ == "NOUN": obj = token.text; break
+        if dobj_token is None and token.dep_ == "dobj": dobj_token = token
+    # Extract the full noun chunk for the direct object
+    if dobj_token:
+        obj = next((chunk.text for chunk in doc.noun_chunks if chunk.root.head == dobj_token.head), dobj_token.text)
     if subject is None: # Fallback for subject
         for token in doc:
             if token.pos_ in ("NOUN", "PROPN"): subject = token.text; break
@@ -107,16 +108,20 @@ def _maybe_swap_vae(pipe, vae_id, device, dtype):
         logger.error(f"CRITICAL: VAE loading failed: {e}", exc_info=True); raise
     return pipe
 
-def _load_ip_adapter_safe(pipe, repo, device):
-    # V6.2 FIX: Robust, multi-path IP-Adapter loader
-    candidates = [("models", "ip-adapter_sd15.bin"), ("models", "ip-adapter_sd15_light.bin"), ("", "ip-adapter_sd15.bin")]
+def _load_ip_adapter_safe(pipe, repo):
+    # V6.3 FIX: Prioritize the 'light' model based on validated project knowledge
+    candidates = [
+        ("models", "ip-adapter_sd15_light.bin"),
+        ("models", "ip-adapter_sd15.bin"),
+        ("", "ip-adapter_sd15_light.bin"),
+        ("", "ip-adapter_sd15.bin")
+    ]
     for sub, weight in candidates:
         try:
             pipe.load_ip_adapter(repo, subfolder=sub, weight_name=weight)
             logger.info(f"✅ IP-Adapter loaded successfully from {repo}/{sub}/{weight}")
             return True
-        except Exception:
-            continue
+        except Exception: continue
     logger.error(f"CRITICAL: All IP-Adapter load attempts failed for repo '{repo}'.")
     return False
 
