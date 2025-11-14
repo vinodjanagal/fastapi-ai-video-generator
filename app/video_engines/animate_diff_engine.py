@@ -204,9 +204,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", type=str, default="classic", choices=["lightning", "classic"])
     p.add_argument("--no-cuda-fp16", action="store_true")
     return p
-
 def main() -> int:
     args = build_parser().parse_args()
+
+    # --- CRITICAL FIX: Create the output directory at the very beginning ---
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[main] Ensured output directory exists: {output_path}")
+    # --- END FIX ---
+
     if args.log_file:
         fh = logging.FileHandler(args.log_file)
         fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - [%(name)s] - %(message)s"))
@@ -214,14 +220,13 @@ def main() -> int:
     try:
         full_prompt_for_classification = args.prompt 
         args.prompt, visual_tokens = compile_prompt(args.prompt)
-        logger.info(f"[main] Compiled prompt with visual tokens: {visual_tokens}")
         
         if not args.manual:
             shot_type = classify_shot_type(full_prompt_for_classification)
             apply_shot_type_tuning(args, shot_type)
             apply_safety_guards(args)
         else:
-            logger.info("[main] --manual flag detected. Skipping automated Shot-Type Engine.")
+            logger.info("[main] --manual flag detected. Skipping automated engines.")
 
         pipe = build_pipeline(args)
         frames = run_inference(pipe, args)
@@ -229,18 +234,17 @@ def main() -> int:
         if not frames:
             raise RuntimeError("Inference returned no frames. Check logs for details.")
 
-        # --- INTEGRATION: Save a first-frame preview for fast feedback ---
         if frames:
-            preview_path = Path(args.output_dir) / "preview_frame_0000.png"
+            preview_path = output_path / "preview_frame_0000.png"
             frames[0].save(preview_path)
             logger.info(f"[preview] First-frame preview saved to: {preview_path}")
-        # --- END INTEGRATION ---
 
-        paths = save_frames(frames, Path(args.output_dir))
+        paths = save_frames(frames, output_path)
         print(json.dumps({"status": "COMPLETED", "frame_paths": paths}))
         
         del pipe, frames, paths; gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
+        
         return 0
     except Exception as e:
         logger.error(f"AnimateDiff engine main function failed: {e}", exc_info=True)
