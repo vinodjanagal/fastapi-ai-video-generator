@@ -201,6 +201,52 @@ def apply_hybrid_continuity(args) -> None:
     logger.info(f"[hybrid] wants_person={wants_person} -> strength={args.strength}, ip_scale={args.ip_adapter_scale}")
 
 
+def classify_shot_type(prompt_text: str) -> str:
+    """
+    Analyzes the prompt text to classify the desired cinematic shot type.
+    This is the core of the V3.3 Shot-Type Intelligence Engine.
+    """
+    prompt_text = prompt_text.lower()
+    if any(k in prompt_text for k in ["extreme close-up", "macro", "detailed eyes"]):
+        return "ECU"  # Extreme Close-Up
+    if any(k in prompt_text for k in ["close-up", "portrait", "focused expression", "face"]):
+        return "CU"   # Close-Up
+    if any(k in prompt_text for k in ["at work", "full body", "medium shot", "inventor standing"]):
+        return "MS"   # Medium Shot
+    if any(k in prompt_text for k in ["wide shot", "full scene", "cabin interior", "environment"]):
+        return "WS"   # Wide Shot
+    
+    # Default to a close-up if a person is mentioned, otherwise medium.
+    if any(k in prompt_text for k in ["inventor", "man", "woman", "person", "character"]):
+        return "CU"
+    return "MS"
+
+def apply_shot_type_tuning(args, shot_type: str):
+    """
+    Applies specific, tested parameter overrides based on the classified shot type.
+    """
+    logger.info(f"[shot-engine] Classified shot type: {shot_type}. Applying tuning.")
+    
+    if shot_type == "ECU": # Extreme Close-Up: High detail, low context
+        args.strength = 0.20
+        args.ip_adapter_scale = 0.0
+        args.guidance_scale = 6.0
+    elif shot_type == "CU": # Close-Up: Focus on subject, some context
+        args.strength = 0.28
+        args.ip_adapter_scale = 0.035
+        args.guidance_scale = 6.5
+    elif shot_type == "MS": # Medium Shot: Balanced subject and environment
+        args.strength = 0.35
+        args.ip_adapter_scale = 0.05
+        args.guidance_scale = 7.0
+    elif shot_type == "WS": # Wide Shot: Focus on environment
+        args.strength = 0.50
+        args.ip_adapter_scale = 0.08
+        args.guidance_scale = 7.5
+
+    logger.info(f"[shot-engine] Final tuned parameters -> strength={args.strength}, ip_scale={args.ip_adapter_scale}, guidance={args.guidance_scale}")
+
+
 # --- CORE FUNCTIONS ---
 def build_pipeline(args) -> AnimateDiffPipeline:
     device, dtype = _select_device_and_dtype(prefer_cuda_fp16=not args.no_cuda_fp16)
@@ -428,7 +474,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    # Add optional file handler early so subsequent logs are persisted
     if args.log_file:
         try:
             fh = logging.FileHandler(args.log_file)
@@ -438,38 +483,41 @@ def main() -> int:
         except Exception as e:
             logger.warning(f"[main] Could not create log file handler ({e}); continuing without file log.", exc_info=True)
 
-    # Step 2: Apply hybrid logic ONLY if not in manual mode
-    if not args.manual:
-        apply_hybrid_continuity(args)
-    else:
-        logger.info("[main] --manual flag detected. Skipping hybrid continuity engine.")
-
     try:
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
-        # Step 1: Compile the prompt
+        # Step 1: Compile the prompt using the original, full prompt for context
+        full_prompt_for_classification = args.prompt 
         args.prompt, visual_tokens = compile_prompt(args.prompt)
         logger.info(f"[main] Compiled prompt with visual tokens: {visual_tokens}")
 
-        # Step 2: Apply hybrid logic
-        apply_hybrid_continuity(args)
+        # --- V3.3 SHOT-TYPE ENGINE ---
+        # Step 2: Classify Shot Type from the original, un-compiled prompt
+        shot_type = classify_shot_type(full_prompt_for_classification)
 
-        # Step 3: Build pipeline
+        # Step 3: Apply parameter tuning UNLESS in manual mode
+        if not args.manual:
+            apply_shot_type_tuning(args, shot_type)
+        else:
+            logger.info("[main] --manual flag detected. Skipping all automated tuning engines.")
+        # --- END V3.3 ENGINE ---
+
+        # Step 4: Build pipeline
         pipe = build_pipeline(args)
 
-        # Step 4: Run inference
+        # Step 5: Run inference
         frames = run_inference(pipe, args)
 
         if not frames:
             raise RuntimeError("Inference returned no frames. Check logs for details.")
 
-        # Step 5: Save frames
+        # Step 6: Save frames
         paths = save_frames(frames, Path(args.output_dir))
         print(json.dumps({"status": "COMPLETED", "frame_paths": paths}))
 
-        # Step 6: Memory Cleanup
+        # Step 7: Memory Cleanup
         del pipe, frames, paths
         gc.collect()
         if torch.cuda.is_available():
@@ -480,7 +528,6 @@ def main() -> int:
         logger.error(f"AnimateDiff engine main function failed: {e}", exc_info=True)
         print(json.dumps({"status": "FAILED", "error": f"{type(e).__name__}: {e}"}))
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
