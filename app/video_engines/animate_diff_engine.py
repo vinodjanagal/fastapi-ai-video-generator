@@ -1,255 +1,208 @@
-# ==============================================================================
-# animate_diff_engine.py - V3.4 DEFINITIVE PRODUCTION SCRIPT
-# This version is the complete, correct, and final build.
-# It includes the robust VAE loader, token-safe prompt compiler, and the
-# intelligent Shot-Type Engine, with all obsolete logic removed.
-# ==============================================================================
-
-import sys
-from pathlib import Path
-
-# --- Dynamic Path Setup ---
-current_file = Path(__file__).resolve()
-project_root = current_file.parent.parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-import argparse
-import json
 import logging
-import gc
-import re
+
 from typing import List, Optional, Tuple
 from PIL import Image
 import torch
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
-from diffusers import (
-    AnimateDiffPipeline,
-    MotionAdapter,
-    UNet2DConditionModel,
-    DDIMScheduler,
-    DPMSolverMultistepScheduler,
-    AutoencoderKL,
-)
 
-# --- Logging Setup ---
+import sys, json, gc, re, argparse
+from pathlib import Path
+
+import spacy
+from diffusers import AnimateDiffPipeline, MotionAdapter, DPMSolverMultistepScheduler, AutoencoderKL
+
+# --- Basic Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(name)s] - %(message)s", stream=sys.stderr)
-logger = logging.getLogger("animate_diff_engine")
+logger = logging.getLogger("v6_engine")
+project_root = Path(__file__).resolve().parent.parent.parent
+if str(project_root) not in sys.path: sys.path.insert(0, str(project_root))
 
+# --- V6.0 SEMANTIC PARSING ENGINE ---
+try:
+    NLP = spacy.load("en_core_web_sm")
+    logger.info("[v6-engine] Lightweight NLP model (spaCy) loaded successfully.")
+except IOError:
+    logger.error("[v6-engine] CRITICAL: spaCy model 'en_core_web_sm' not found.")
+    logger.error("--> Please run: python -m spacy download en_core_web_sm")
+    sys.exit(1)
 
-# --- UTILITIES ---
-def _select_device_and_dtype(prefer_cuda_fp16: bool = True) -> Tuple[torch.device, torch.dtype]:
-    if torch.cuda.is_available():
-        return torch.device("cuda"), (torch.float16 if prefer_cuda_fp16 else torch.float32)
-    return torch.device("cpu"), torch.float32
+def semantic_parser(prompt: str) -> dict:
+    doc = NLP(prompt)
+    subject, action, obj, environment = None, None, None, None
+    for token in doc:
+        if subject is None and token.dep_ == "nsubj" and token.pos_ in ("NOUN", "PROPN"): subject = token.text
+        if action is None and token.pos_ == "VERB": action = token.lemma_
+        if obj is None and token.dep_ == "dobj": obj = token.text
+    # V6.2 FIX: Fallback for objects in prepositional phrases
+    if obj is None:
+        for token in doc:
+            if token.dep_ == "pobj" and token.pos_ == "NOUN": obj = token.text; break
+    if subject is None: # Fallback for subject
+        for token in doc:
+            if token.pos_ in ("NOUN", "PROPN"): subject = token.text; break
+    for chunk in doc.noun_chunks:
+        if chunk.root.head.dep_ == "prep": environment = chunk.text; break
+    return {"subject": subject, "action": action, "object": obj, "environment": environment}
 
-def _apply_memory_saving(pipe: AnimateDiffPipeline) -> None:
-    for fn_name in ("enable_attention_slicing", "enable_vae_slicing", "enable_vae_tiling"):
-        if hasattr(pipe, fn_name):
-            getattr(pipe, fn_name)()
+def build_semantic_prompt(raw_prompt: str, user_negative_prompt: str, shot_type: str, semantic_parts: dict) -> Tuple[str, str]:
+    logger.info(f"[v6-parser] Semantic parts extracted: {semantic_parts}")
+    # V6.2 FIX: Use parentheses for correct weighting
+    subject = f"({semantic_parts['subject']}:1.3)" if semantic_parts["subject"] else ""
+    action = semantic_parts["action"] or ""
+    obj = f"({semantic_parts['object']}:1.4)" if semantic_parts["object"] else ""
+    # V6.2 FIX: Context-aware environment fallback
+    env = f"({semantic_parts['environment']}:1.1)" if semantic_parts["environment"] else {
+        "ECU": "(studio lighting:1.1)", "CU": "(soft indoor background:1.1)",
+        "MS": "(work environment:1.1)", "WS": "(large cinematic environment:1.1)"
+    }.get(shot_type, "(cinematic background:1.1)")
+    style = "photorealistic, ultra-realistic, cinematic lighting, sharp focus, 8k"
+    shot_style = {
+        "CU": "(cinematic close-up:1.2)", "MS": "medium shot",
+        "WS": "wide establishing shot", "ECU": "(extreme close-up:1.2)"
+    }.get(shot_type, "")
+    positive_parts = [env, shot_style, subject, action, obj, style]
+    pos_prompt = ", ".join(filter(None, positive_parts))
+    # V6.2 FIX: Merge auto-generated negative with user-provided negative
+    auto_neg_prompt = "(deformed, distorted, bad anatomy:1.3), blurry, ugly, cartoon, mutated hands, text, watermark, signature, wooden panel"
+    final_neg_prompt = ", ".join(filter(None, [auto_neg_prompt, user_negative_prompt]))
+    logger.info(f"[v6-parser] Final Positive Prompt: {pos_prompt}")
+    return pos_prompt, final_neg_prompt
 
-def _maybe_swap_vae(pipe: AnimateDiffPipeline, vae_id: Optional[str], device: torch.device, dtype: torch.dtype) -> AnimateDiffPipeline:
-    if not vae_id:
-        logger.info("[vae] No VAE specified — using default.")
-        return pipe
-
-    logger.info(f"[vae] Trying VAE: {vae_id}")
-    try:
-        # CRITICAL FIX: On CPU, we MUST use float32. Forcing this prevents silent failures.
-        vae_dtype = torch.float32 if device.type == "cpu" else dtype
-        logger.info(f"[vae] Using VAE dtype: {vae_dtype} for device: {device.type}")
-
-        # This is a more robust method for loading single-file VAEs.
-        vae = AutoencoderKL.from_pretrained(vae_id, torch_dtype=vae_dtype)
-        
-        pipe.vae = vae.to(device)
-        logger.info(f"[vae] ✅ SUCCESS: VAE swapped and verified for {vae_id}")
-    except Exception as e:
-        logger.error(f"[vae] FAILED TO LOAD VAE: {e}", exc_info=True)
-        logger.warning("[vae] CRITICAL: Falling back to the pipeline's default VAE.")
-    return pipe
-
-
-
-
-def compile_prompt(raw_prompt: str, max_phrases: int = 12) -> Tuple[str, List[str]]:
-    original_phrases = [p.strip() for p in raw_prompt.split(",") if p.strip()]
-    priority, others = [], []
-    for p in original_phrases:
-        search_p = re.sub(r'[:\d\.]', '', p).lower()
-        if re.search(r"(inventor|man|woman|person|face|hands|worker|scientist|engineer|girl|guy|portrait|character)", search_p):
-            priority.append(p)
-        else:
-            others.append(p)
-    combined_phrases = (priority + others)[:max_phrases]
-    suffix = "photorealistic, cinematic, ultra-realistic, high detail"
-    final_prompt = ", ".join(combined_phrases) + ", " + suffix
-    logger.info(f"[prompt-compile] Rebuilt prompt from key phrases: {combined_phrases}")
-    return final_prompt, combined_phrases
-
-def classify_shot_type(prompt_text: str) -> str:
-    prompt_text = prompt_text.lower()
-    if any(k in prompt_text for k in ["extreme close-up", "macro", "detailed eyes"]): return "ECU"
-    if any(k in prompt_text for k in ["close-up", "portrait", "focused expression", "face"]): return "CU"
-    if any(k in prompt_text for k in ["at work", "full body", "medium shot", "inventor standing"]): return "MS"
-    if any(k in prompt_text for k in ["wide shot", "full scene", "cabin interior", "environment"]): return "WS"
-    if any(k in prompt_text for k in ["inventor", "man", "woman", "person", "character"]): return "CU"
+# --- V6.2 UTILITY FUNCTIONS (REFINED) ---
+def classify_shot_type(prompt_text: str, semantic_parts: dict) -> str:
+    text = prompt_text.lower()
+    if any(k in text for k in ["macro", "extreme close-up"]): return "ECU"
+    if any(k in text for k in ["close-up", "portrait", "face"]): return "CU"
+    if any(k in text for k in ["wide shot", "full scene"]): return "WS"
+    if semantic_parts.get("subject") and semantic_parts.get("environment"): return "MS"
+    if semantic_parts.get("subject"): return "CU"
     return "MS"
 
-def apply_shot_type_tuning(args, shot_type: str):
-    logger.info(f"[shot-engine] Classified shot type: {shot_type}. Applying tuning.")
-    if shot_type == "ECU":
-        args.strength, args.ip_adapter_scale, args.guidance_scale = 0.20, 0.0, 6.0
-    elif shot_type == "CU":
-        args.strength, args.ip_adapter_scale, args.guidance_scale = 0.28, 0.035, 6.5
-    elif shot_type == "MS":
-        args.strength, args.ip_adapter_scale, args.guidance_scale = 0.35, 0.05, 7.0
-    elif shot_type == "WS":
-        args.strength, args.ip_adapter_scale, args.guidance_scale = 0.50, 0.08, 7.5
-    logger.info(f"[shot-engine] Final tuned parameters -> strength={args.strength}, ip_scale={args.ip_adapter_scale}, guidance={args.guidance_scale}")
-
+def apply_param_tuning(args, shot_type: str):
+    logger.info(f"[param-engine] Classified shot type: {shot_type}. Applying tuning.")
+    if not args.manual:
+        # Only set defaults if the user has not provided them via CLI
+        args.strength = args.strength if args.strength is not None else {"ECU": 0.20, "CU": 0.28, "MS": 0.35, "WS": 0.50}.get(shot_type, 0.3)
+        args.ip_adapter_scale = args.ip_adapter_scale if args.ip_adapter_scale is not None else {"ECU": 0.0, "CU": 0.035, "MS": 0.05, "WS": 0.08}.get(shot_type, 0.04)
+        args.guidance_scale = args.guidance_scale if args.guidance_scale is not None else {"ECU": 6.0, "CU": 6.5, "MS": 7.0, "WS": 7.5}.get(shot_type, 7.0)
+    logger.info(f"[param-engine] Final tuned parameters -> strength={args.strength}, ip_scale={args.ip_adapter_scale}, guidance={args.guidance_scale}")
 
 def apply_safety_guards(args):
-    """Prevents unstable parameter combinations that can cause noise collapse."""
-    if not args.manual:
-        original_steps = args.num_steps
-        if args.num_steps < 15:
-            args.num_steps = 15
-            logger.warning(f"[safety-guard] num_steps was {original_steps}, which is too low for a stable preview. Forcing to {args.num_steps}.")
+    if not args.manual and args.num_steps < 15:
+        logger.warning(f"[safety-guard] num_steps was {args.num_steps}, too low. Forcing to 15."); args.num_steps = 15
 
-# --- CORE FUNCTIONS ---
-def build_pipeline(args) -> AnimateDiffPipeline:
-    device, dtype = _select_device_and_dtype(prefer_cuda_fp16=not args.no_cuda_fp16)
-    logger.info(f"[pipeline_builder] Mode: {args.mode}, Steps: {args.num_steps}, Base: {args.base_model}")
-    
-    motion_repo = "guoyww/animatediff-motion-adapter-v1-5-2"
-    logger.info(f"[classic] Loading motion adapter from {motion_repo}")
-    motion_adapter = MotionAdapter.from_pretrained(motion_repo, torch_dtype=dtype)
-    pipe = AnimateDiffPipeline.from_pretrained(args.base_model, motion_adapter=motion_adapter, torch_dtype=dtype)
-
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config, algorithm_type="dpmsolver++", use_karras_sigmas=True)
-    logger.info("[scheduler] ✅ Swapped to: DPM++ 2M Karras")
-
-    if args.ip_adapter_image_path and args.ip_adapter_scale > 0.0:
-        logger.info("[ip_adapter] Enabled. Loading IP-Adapter model...")
-        pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name="ip-adapter_sd15_light.bin")
-        pipe.set_ip_adapter_scale(args.ip_adapter_scale)
-        logger.info(f"[ip_adapter] ✅ Loaded successfully. Scale = {args.ip_adapter_scale}")
-    
-    pipe = _maybe_swap_vae(pipe, vae_id=args.vae_model, device=device, dtype=dtype)
-    _apply_memory_saving(pipe)
-    pipe.to(device)
-    logger.info(f"[{args.mode}] ✅ AnimateDiff pipeline is ready on {device}.")
+def _maybe_swap_vae(pipe, vae_id, device, dtype):
+    if not vae_id: return pipe
+    logger.info(f"[vae] Trying VAE: {vae_id}")
+    try:
+        vae_dtype = torch.float32 if device.type == "cpu" else dtype
+        try: # V6.2 FIX: Try standard subfolder first
+            vae = AutoencoderKL.from_pretrained(vae_id, torch_dtype=vae_dtype, subfolder="vae")
+        except Exception: # Fallback for VAEs not in a subfolder
+            vae = AutoencoderKL.from_pretrained(vae_id, torch_dtype=vae_dtype)
+        pipe.vae = vae.to(device)
+        logger.info(f"✅ VAE swapped successfully: {vae_id}")
+    except Exception as e:
+        logger.error(f"CRITICAL: VAE loading failed: {e}", exc_info=True); raise
     return pipe
 
-def run_inference(pipe: AnimateDiffPipeline, args) -> List[Image.Image]:
-    try:
-        device = getattr(pipe, "device", next(pipe.unet.parameters()).device)
-        gen = torch.Generator(device=device).manual_seed(args.seed)
-        kwargs = {
-            "prompt": args.prompt, "negative_prompt": args.negative_prompt,
-            "num_frames": args.num_frames, "num_inference_steps": args.num_steps,
-            "guidance_scale": args.guidance_scale, "width": args.width, "height": args.height,
-            "generator": gen,
-        }
-        if args.ip_adapter_scale > 0 and args.ip_adapter_image_path:
-            kwargs["ip_adapter_image"] = Image.open(args.ip_adapter_image_path).convert("RGB")
-        if args.init_image and 0 < args.strength < 1:
-            kwargs["image"] = Image.open(args.init_image).convert("RGB")
-            kwargs["strength"] = args.strength
-        
-        logger.info(f"[prompt-debug] Final prompt token count: {len(pipe.tokenizer(args.prompt).input_ids)}")
-        logger.info("[inference] Running AnimateDiff pipeline...")
-        out = pipe(**kwargs)
-        frames = getattr(out, "frames", [[]])[0]
-        if not frames: raise RuntimeError("Pipeline returned an empty frame list")
-        logger.info(f"[inference] ✅ Generated {len(frames)} frames successfully.")
-        return frames
-    except Exception as e:
-        logger.error(f"[inference] CRASH: {e}", exc_info=True)
-        raise
+def _load_ip_adapter_safe(pipe, repo, device):
+    # V6.2 FIX: Robust, multi-path IP-Adapter loader
+    candidates = [("models", "ip-adapter_sd15.bin"), ("models", "ip-adapter_sd15_light.bin"), ("", "ip-adapter_sd15.bin")]
+    for sub, weight in candidates:
+        try:
+            pipe.load_ip_adapter(repo, subfolder=sub, weight_name=weight)
+            logger.info(f"✅ IP-Adapter loaded successfully from {repo}/{sub}/{weight}")
+            return True
+        except Exception:
+            continue
+    logger.error(f"CRITICAL: All IP-Adapter load attempts failed for repo '{repo}'.")
+    return False
 
-def save_frames(frames: List[Image.Image], output_dir: Path) -> List[str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    paths = []
-    for i, frame in enumerate(frames):
-        path = output_dir / f"frame_{i:04d}.png"
-        frame.save(path)
-        paths.append(str(path))
-    return paths
+# --- CORE RENDERING LOGIC ---
+def build_pipeline(args, device, dtype):
+    logger.info(f"Loading pipeline for base model: {args.base_model}")
+    motion_adapter = MotionAdapter.from_pretrained("guoyww/animatediff-motion-adapter-v1-5-2", torch_dtype=dtype)
+    pipe = AnimateDiffPipeline.from_pretrained(args.base_model, motion_adapter=motion_adapter, torch_dtype=dtype)
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config, algorithm_type="dpmsolver++", use_karras_sigmas=True)
+    pipe = _maybe_swap_vae(pipe, args.vae_model, device, dtype)
+    if args.ip_adapter_scale > 0.0 and args.ip_adapter_image_path:
+        if _load_ip_adapter_safe(pipe, args.ip_adapter_repo, device):
+            pipe.set_ip_adapter_scale(args.ip_adapter_scale)
+    # V6.2 FIX: Add memory slicing for CPU
+    pipe.enable_attention_slicing()
+    pipe.enable_vae_slicing()
+    pipe.to(device)
+    return pipe
 
-# --- CLI AND MAIN EXECUTION ---
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="AnimateDiff Engine (V3.4 Definitive)")
+def run_inference(pipe, args, device):
+    gen = torch.Generator(device=device).manual_seed(args.seed)
+    # V6.2 FIX: Pre-normalize all image inputs
+    ip_adapter_image = Image.open(args.ip_adapter_image_path).convert("RGB").resize((args.width, args.height), Image.LANCZOS) if args.ip_adapter_image_path else None
+    init_image = Image.open(args.init_image).convert("RGB").resize((args.width, args.height), Image.LANCZOS) if args.init_image else None
+    kwargs = {"prompt": args.prompt, "negative_prompt": args.negative_prompt, "num_frames": args.num_frames, "num_inference_steps": args.num_steps, "guidance_scale": args.guidance_scale, "width": args.width, "height": args.height, "generator": gen}
+    if args.ip_adapter_scale > 0: kwargs["ip_adapter_image"] = ip_adapter_image
+    if args.init_image and 0 < args.strength < 1: kwargs["image"] = init_image; kwargs["strength"] = args.strength
+    logger.info("Running inference...")
+    out = pipe(**kwargs)
+    frames = out.frames[0] # V6.2 FIX: Use direct access
+    if not frames: raise RuntimeError("Pipeline returned an empty frame list")
+    logger.info(f"✅ Generated {len(frames)} frames successfully.")
+    return frames
+
+def build_parser():
+    p = argparse.ArgumentParser(description="AnimateDiff V6.2 Production-Ready Semantic Engine")
     p.add_argument("--prompt", required=True)
-    p.add_argument("--negative-prompt", type=str, default="")
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--init-image", type=str)
+    p.add_argument("--ip-adapter-image-path", type=str)
     p.add_argument("--base-model", default="SG161222/Realistic_Vision_V5.1_noVAE")
-    p.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-mse")
+    p.add_argument("--vae-model", default="stabilityai/sd-vae-ft-mse")
+    p.add_argument("--ip-adapter-repo", default="h94/IP-Adapter")
     p.add_argument("--num-frames", type=int, default=16)
-    p.add_argument("--num-steps", type=int, default=25)
-    p.add_argument("--guidance-scale", type=float, default=7.0)
-    p.add_argument("--ip-adapter-image-path", type=str, default=None)
-    p.add_argument("--ip-adapter-scale", type=float, default=0.0)
-    p.add_argument("--init-image", type=str, default=None)
-    p.add_argument("--strength", type=float, default=1.0)
+    p.add_argument("--num-steps", type=int, default=30)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--height", type=int, default=512)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--log-file", type=str, default=None)
-    p.add_argument("--manual", action="store_true", help="Disable the Shot-Type Engine for manual tuning.")
-    # Obsolete arguments kept for API consistency if needed, but not used by engine
-    p.add_argument("--scheduler", type=str, default="DPM++ 2M Karras", choices=["DPM++ 2M Karras", "DDIM"])
-    p.add_argument("--mode", type=str, default="classic", choices=["lightning", "classic"])
-    p.add_argument("--no-cuda-fp16", action="store_true")
+    p.add_argument("--manual", action="store_true")
+    p.add_argument("--strength", type=float, default=None)
+    p.add_argument("--ip-adapter-scale", type=float, default=None)
+    p.add_argument("--guidance-scale", type=float, default=None)
+    p.add_argument("--negative-prompt", type=str, default="", help="Optional user-provided negative prompts to merge.")
     return p
-def main() -> int:
-    args = build_parser().parse_args()
 
-    # --- CRITICAL FIX: Create the output directory at the very beginning ---
-    output_path = Path(args.output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"[main] Ensured output directory exists: {output_path}")
-    # --- END FIX ---
-
-    if args.log_file:
-        fh = logging.FileHandler(args.log_file)
-        fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - [%(name)s] - %(message)s"))
-        logger.addHandler(fh)
-    try:
-        full_prompt_for_classification = args.prompt 
-        args.prompt, visual_tokens = compile_prompt(args.prompt)
-        
-        if not args.manual:
-            shot_type = classify_shot_type(full_prompt_for_classification)
-            apply_shot_type_tuning(args, shot_type)
-            apply_safety_guards(args)
-        else:
-            logger.info("[main] --manual flag detected. Skipping automated engines.")
-
-        pipe = build_pipeline(args)
-        frames = run_inference(pipe, args)
-
-        if not frames:
-            raise RuntimeError("Inference returned no frames. Check logs for details.")
-
-        if frames:
-            preview_path = output_path / "preview_frame_0000.png"
-            frames[0].save(preview_path)
-            logger.info(f"[preview] First-frame preview saved to: {preview_path}")
-
-        paths = save_frames(frames, output_path)
-        print(json.dumps({"status": "COMPLETED", "frame_paths": paths}))
-        
-        del pipe, frames, paths; gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        
-        return 0
-    except Exception as e:
-        logger.error(f"AnimateDiff engine main function failed: {e}", exc_info=True)
-        print(json.dumps({"status": "FAILED", "error": f"{type(e).__name__}: {e}"}))
-        return 1
-
+# --- MAIN ORCHESTRATOR ---
 if __name__ == "__main__":
-    sys.exit(main())
+    args = build_parser().parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        device, dtype = torch.device("cpu"), torch.float32
+       
+        semantic_parts = semantic_parser(args.prompt)
+        shot_type = classify_shot_type(args.prompt, semantic_parts)
+        args.prompt, args.negative_prompt = build_semantic_prompt(args.prompt, args.negative_prompt, shot_type, semantic_parts)
+       
+        apply_param_tuning(args, shot_type)
+        apply_safety_guards(args)
+       
+        pipe = build_pipeline(args, device, dtype)
+        frames = run_inference(pipe, args, device)
+       
+        if frames:
+            # V6.2 FIX: Correct save logic
+            preview_path = output_dir / "preview_frame_0000.png"
+            frames[0].save(preview_path)
+            logger.info(f"[preview] Preview saved to: {preview_path}")
+            paths = []
+            for i, frame in enumerate(frames):
+                path = output_dir / f"frame_{i:04d}.png"; frame.save(path); paths.append(str(path))
+            print(json.dumps({"status": "COMPLETED", "frame_paths": paths}))
+       
+        del pipe, frames, NLP; gc.collect()
+       
+    except Exception as e:
+        logger.error(f"V6.2 Engine failed: {e}", exc_info=True)
+        print(json.dumps({"status": "FAILED", "error": f"{type(e).__name__}: {e}"}))
+        sys.exit(1)
