@@ -174,6 +174,7 @@ def compile_prompt(raw_prompt: str, max_phrases: int = 12) -> Tuple[str, List[st
     return final_prompt, combined_phrases
 
 
+
 def apply_hybrid_continuity(args) -> None:
     """
     Auto-adjusts init_image strength and IP-Adapter scale
@@ -419,6 +420,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", type=str, default="classic", choices=["lightning", "classic"])
     p.add_argument("--no-cuda-fp16", action="store_true")
     p.add_argument("--log-file", type=str, default=None, help="Optional path to persist logger output.")
+    p.add_argument("--manual", action="store_true", help="Disable the hybrid continuity engine to allow manual parameter tuning.")
+
     return p
 
 
@@ -434,6 +437,12 @@ def main() -> int:
             logger.info(f"[main] Logging to file: {args.log_file}")
         except Exception as e:
             logger.warning(f"[main] Could not create log file handler ({e}); continuing without file log.", exc_info=True)
+
+    # Step 2: Apply hybrid logic ONLY if not in manual mode
+    if not args.manual:
+        apply_hybrid_continuity(args)
+    else:
+        logger.info("[main] --manual flag detected. Skipping hybrid continuity engine.")
 
     try:
         if torch.cuda.is_available():
