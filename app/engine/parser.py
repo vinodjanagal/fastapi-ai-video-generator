@@ -3,7 +3,7 @@ from typing import Dict, Tuple, Optional
 import logging
 import spacy
 
-logger = logging.getLogger("v6_parser")
+logger = logging.getLogger("v7_parser")
 
 def _load_spacy_model():
     """Loads the spaCy model with optimized pipes for our use case."""
@@ -23,8 +23,7 @@ def semantic_parser(prompt: str) -> Dict[str, Optional[str]]:
     This is the definitive, tested, and correct implementation.
     """
     doc = NLP(prompt)
-
-    # Helper to map a token to its full noun chunk
+    
     def get_chunk_for_token(token):
         if token is None: return None
         for chunk in doc.noun_chunks:
@@ -34,7 +33,7 @@ def semantic_parser(prompt: str) -> Dict[str, Optional[str]]:
 
     subject_tok, action_tok, object_tok, env_tok = None, None, None, None
     
-    # 1. Find the root of the sentence, which is usually the main verb
+    # 1. Find the ROOT of the sentence, which is usually the main verb
     for token in doc:
         if token.dep_ == "ROOT" and token.pos_ == "VERB":
             action_tok = token
@@ -50,7 +49,6 @@ def semantic_parser(prompt: str) -> Dict[str, Optional[str]]:
         for child in action_tok.children:
             if child.dep_ == "nsubj": subject_tok = child
             if child.dep_ == "dobj": object_tok = child
-            # A preposition attached to the verb often governs the object or environment
             if child.dep_ == "prep":
                 # Check for location prepositions to identify the environment
                 if child.text.lower() in ["in", "at", "on", "inside", "near", "under", "within"]:
@@ -80,12 +78,8 @@ def semantic_parser(prompt: str) -> Dict[str, Optional[str]]:
     obj = get_chunk_for_token(object_tok)
     environment = get_chunk_for_token(env_tok)
 
-    # 5. Post-processing to clean up results like "cat on a windowsill"
-    if subject and environment and not action and not obj:
-        # If the only other noun is the environment, it's likely just a location, not an object
-        pass
-    elif obj == environment:
-        obj = None # Avoid duplication
+    # 5. Post-processing to clean up results
+    if obj == environment: obj = None # Avoid duplication
 
     return {"subject": subject, "action": action, "object": obj, "environment": environment}
 
@@ -94,25 +88,19 @@ def build_semantic_prompt(
     raw_prompt: str, user_negative_prompt: str, shot_type: str, semantic_parts: Dict[str, Optional[str]]
 ) -> Tuple[str, str]:
     logger.info(f"Semantic parts extracted: {semantic_parts}")
-
     subject = f"({semantic_parts['subject']}:1.3)" if semantic_parts.get("subject") else ""
     action = semantic_parts.get("action") or ""
     obj = f"({semantic_parts['object']}:1.4)" if semantic_parts.get("object") else ""
-
     env_map = {
         "ECU": "(studio lighting:1.1)", "CU": "(soft indoor background:1.1)",
         "MS": "(work environment:1.1)", "WS": "(large cinematic environment:1.1)"
     }
     env = f"({semantic_parts['environment']}:1.1)" if semantic_parts.get("environment") else env_map.get(shot_type, "(cinematic background:1.1)")
-
     style = "photorealistic, ultra-realistic, cinematic lighting, sharp focus, 8k"
     shot_style = {"CU": "(cinematic close-up:1.2)", "MS": "medium shot", "WS": "wide establishing shot", "ECU": "(extreme close-up:1.2)"}.get(shot_type, "")
-
     positive_parts = [env, shot_style, subject, action, obj, style]
     pos_prompt = ", ".join(filter(None, positive_parts))
-
     auto_neg_prompt = "(deformed, distorted, bad anatomy:1.3), blurry, ugly, cartoon, mutated hands, text, watermark"
     final_neg_prompt = ", ".join(filter(None, [auto_neg_prompt, user_negative_prompt or ""]))
-
     logger.info(f"Final Positive Prompt: {pos_prompt}")
     return pos_prompt, final_neg_prompt

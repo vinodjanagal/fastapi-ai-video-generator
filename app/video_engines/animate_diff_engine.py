@@ -10,6 +10,7 @@ from PIL import Image
 import logging
 import numpy as np
 import torch
+from app.engine.cinematics import compute_runtime_continuity
 
 from diffusers import AnimateDiffPipeline, MotionAdapter, DPMSolverMultistepScheduler, AutoencoderKL
 

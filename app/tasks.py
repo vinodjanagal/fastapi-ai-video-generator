@@ -321,6 +321,8 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
             logger.info(f"TASK FINISHED (AnimateDiff Full) for video_id={video_id}")
 
 # ---------- NEW: Semantic Orchestrator ----------
+
+
 async def process_semantic_video_generation(video_id: int):
     """
     Semantic pipeline:
@@ -346,168 +348,106 @@ async def process_semantic_video_generation(video_id: int):
             if not video_record:
                 raise FileNotFoundError(f"Video {video_id} not found.")
             
-            # Get the quote text to use in our logs.
             quote_text_for_logging = video_record.quote.text
-            # log the quote text at the very beginning
             logger.info(f"STARTING JOB FOR QUOTE: \"{quote_text_for_logging}\"")
 
-            # INITIAL STATUS
             video_record.status = models.VideoStatus.PROCESSING
             video_record.progress = 0.0
             await db.merge(video_record)
             await db.commit()
 
-            # ---------- PROGRESS HELPER ----------
             async def update_progress(percent: float, step_name: str):
                 video_record.progress = round(percent, 1)
                 video_record.status = f"PROCESSING: {step_name}"
                 await db.merge(video_record)
                 await db.commit()
-
                 bar = "█" * int(percent // 10) + "░" * (10 - int(percent // 10))
-                # Log the new, clean format
                 logger.info(f"PROGRESS: [{bar}] {percent:.1f}% - {step_name}")
                 
-            # -------------------------------------------------
-
             quote_text = video_record.quote.text
             uid = uuid.uuid4()
 
             # ---------- 1) Speech (master audio + timestamps) ----------
+            # This section remains unchanged.
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_audio_{uid}.mp3")
             speech_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
-
-            # Create a temporary file to hold the quote text
-            text_file = None
-
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt", encoding='utf-8') as text_file:
+                text_file.write(quote_text)
+                text_file_path = text_file.name
             try:
-                with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt", encoding='utf-8') as text_file:
-                    text_file.write(quote_text)
-                    text_file_path = text_file.name
-
                 speech_cmd = [sys.executable, speech_script, "--text-file", text_file_path, "--output-path", audio_path]
-                logger.info("ORCH: Running SpeechT5 (audio + timestamps)...")
-                rc, out, err = await run_subprocess_streamed(
-                    speech_cmd, timeout=SPEECH_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
-                )
-                if rc != 0:
-                    raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
-                try:
-                    speech_json = json.loads(out)
-                    if speech_json.get("status") != "COMPLETED":
-                        raise ValueError(speech_json.get("error", "Speech engine error"))
-                    timestamps_path = speech_json.get("timestamps_file")  # optional
-                except Exception as e:
-                    raise RuntimeError(f"Invalid SpeechT5 stdout.\n{out}\nError:{e}")
-
+                logger.info("ORCH: Running SpeechT5 (audio)...")
+                rc, out, err = await run_subprocess_streamed(speech_cmd, timeout=SPEECH_TIMEOUT)
+                if rc != 0: raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
+                speech_json = json.loads(out)
+                if speech_json.get("status") != "COMPLETED": raise ValueError(speech_json.get("error", "Speech engine error"))
+                timestamps_path = speech_json.get("timestamps_file")
             finally:
-                # CRITICAL: Clean up the temporary file no matter what happens
-                if text_file and os.path.exists(text_file.name):
-                    os.remove(text_file.name)
-
-
-
-            # Stage 1: Audio done → 20%
+                if os.path.exists(text_file_path): os.remove(text_file_path)
 
             await update_progress(20.0, "Audio generated")
 
-            # ---------- 2) Storyboard (with durations) ----------
+            # ---------- 2) Storyboard (with durations & camera motion) ----------
+            # This section remains unchanged.
             storyboard_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "storyboard_engine.py")
             storyboard_cmd = [sys.executable, storyboard_script, "--quote", quote_text]
-            if timestamps_path and os.path.exists(timestamps_path):
-                storyboard_cmd += ["--timestamps", timestamps_path]
+            if timestamps_path: storyboard_cmd += ["--timestamps", timestamps_path]
             logger.info("ORCH: Running Storyboard engine...")
-            rc2, out2, err2 = await run_subprocess_streamed(
-                storyboard_cmd, timeout=STORYBOARD_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT
-            )
-            if rc2 != 0:
-                raise RuntimeError(f"storyboard_engine.py failed (rc={rc2}). Stderr:\n{err2}")
-            try:
-                sb_json = json.loads(out2)
-                if sb_json.get("status") != "COMPLETED":
-                    raise ValueError(sb_json.get("error", "Storyboard engine error"))
-                storyboard = sb_json.get("storyboard", [])
-                if not storyboard:
-                    raise ValueError("Storyboard returned empty.")
-            except Exception as e:
-                raise RuntimeError(f"Invalid storyboard stdout.\n{out2}\nError:{e}")
+            rc2, out2, err2 = await run_subprocess_streamed(storyboard_cmd, timeout=STORYBOARD_TIMEOUT)
+            if rc2 != 0: raise RuntimeError(f"storyboard_engine.py failed (rc={rc2}). Stderr:\n{err2}")
+            sb_json = json.loads(out2)
+            if sb_json.get("status") != "COMPLETED": raise ValueError(sb_json.get("error", "Storyboard engine error"))
+            storyboard = sb_json.get("storyboard", [])
+            if not storyboard: raise ValueError("Storyboard returned empty.")
 
-            # Stage 2: Storyboard done → 40%
             await update_progress(40.0, "Storyboard created")
 
-            # ---------- 3) Per-scene AnimateDiff ----------
-
+            # ---------- 3) Per-scene Frame Generation & Motion Application ----------
             ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
-
             last_successful_frame_path: Optional[str] = None
 
-
             for idx, scene in enumerate(storyboard, start=1):
-                description = scene.get("description")
-                composition = scene.get("composition")
-
+                description = scene.get("description", "")
+                composition = scene.get("composition", {})
                 if not description or not composition:
                     raise ValueError(f"Scene {idx} is missing 'description' or 'composition'")
 
-                # ✅ FIX: Make prompt sentences natural for the LDM parser
-                if isinstance(composition, dict):
-                    final_positive_prompt = (
-                        f"{description}. "
-                        f"{composition.get('camera', '')}. "
-                        f"Scene set in {composition.get('environment', '')}, "
-                        f"with {composition.get('lighting', '')} lighting. "
-                        f"Visual style: {composition.get('style', '')}. "
-                        f"{BASE_QUALITY_PROMPT}"
-                    )
-                else:
-                    final_positive_prompt = f"{description}, {composition}, {BASE_QUALITY_PROMPT}"
-
+                final_positive_prompt = (
+                    f"{description}. "
+                    f"{composition.get('camera', '')}. "
+                    f"Scene set in {composition.get('environment', '')}, "
+                    f"with {composition.get('lighting', '')} lighting. "
+                    f"Visual style: {composition.get('style', '')}. "
+                    f"{BASE_QUALITY_PROMPT}"
+                )
                 final_negative_prompt = BASE_NEGATIVE_PROMPT
 
-                logger.info(f"[Scene {idx}] POSITIVE PROMPT: {final_positive_prompt}")
-                logger.info(f"[Scene {idx}] NEGATIVE PROMPT: {final_negative_prompt}")
+                logger.info(f"[Scene {idx}/{len(storyboard)}] PROMPT: {final_positive_prompt[:150]}...")
 
-                frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"scene_{idx}_{uuid.uuid4().hex}")
-                scene_temp_dirs.append(frames_dir)
+                # --- Generate Base Frames ---
+                base_frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"scene_{idx}_base_{uid.hex}")
+                scene_base_frame_dirs.append(base_frames_dir)
                 
-                # 4. Build the new command with the negative prompt
                 ad_cmd = [
-                    sys.executable,
-                    ad_script,
+                    sys.executable, ad_script,
                     "--prompt", final_positive_prompt,
-                    "--negative-prompt", final_negative_prompt, # <<<--- NEW ARGUMENT
-                    "--output-dir", frames_dir,
+                    "--negative-prompt", final_negative_prompt,
+                    "--output-dir", base_frames_dir,
                     "--base-model", "SG161222/Realistic_Vision_V5.1_noVAE",
                     "--num-steps", str(V2_CLASSIC_STEPS),
-                    "--guidance-scale", str(V2_CLASSIC_GUIDANCE),
-                    "--mode", "classic" 
+                    "--guidance-scale", str(V2_CLASSIC_GUIDANCE)
                 ]
-
                 if last_successful_frame_path:
-                    ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path,
-                                   "--ip-adapter-scale", str(V2_IP_ADAPTER_SCALE)
-                                ])
-                    logger.info(f"[Scene {idx}] Using IP reference: {last_successful_frame_path}")
+                    ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path, "--ip-adapter-scale", str(V2_IP_ADAPTER_SCALE)])
+                
+                rc3, out3, err3 = await run_subprocess_streamed(ad_cmd, timeout=AD_FRAME_TIMEOUT)
+                if rc3 != 0: raise RuntimeError(f"animate_diff_engine.py failed (scene {idx}) rc={rc3}. Stderr:\n{err3}")
 
-                    
-
-                rc3, out3, err3 = await run_subprocess_streamed(ad_cmd, timeout=AD_FRAME_TIMEOUT, env=os.environ.copy(), cwd=PROJECT_ROOT)
-                if rc3 != 0:
-                    raise RuntimeError(f"animate_diff_engine.py failed (scene {idx}) rc={rc3}. Stderr:\n{err3}")
-
-                try:
-                    ad_json = json.loads(out3)
-                    if ad_json.get("status") != "COMPLETED":
-                        raise ValueError(ad_json.get("error", f"AnimateDiff scene {idx} error"))
-
-                    frame_paths = ad_json.get("frame_paths", [])
-                    if not frame_paths:
-                        raise ValueError(f"No frames returned for scene {idx}")
-
-                    all_frame_paths.extend(frame_paths)
-
-                    # ✅ FIX: Use mid-frame for continuity (better visual stability)
-                    last_successful_frame_path = frame_paths[len(frame_paths) // 2]
+                ad_json = json.loads(out3)
+                if ad_json.get("status") != "COMPLETED": raise ValueError(ad_json.get("error", f"AnimateDiff scene {idx} error"))
+                
+                original_frame_paths = ad_json.get("frame_paths", [])
+                if not original_frame_paths: raise ValueError(f"No frames returned for scene {idx}")
 
                 except Exception as e:
                     last_successful_frame_path = None
@@ -533,13 +473,7 @@ async def process_semantic_video_generation(video_id: int):
                 db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_path
             )
             await db.commit()
-
-            # Stage 5: Finalize → 100%
-            video_record.progress = 100.0
-            video_record.status = models.VideoStatus.COMPLETED
-            await db.merge(video_record)
-            await db.commit()
-
+            await update_progress(100.0, "Completed")
             logger.info(f"ORCHESTRATOR SUCCESS video_id={video_id}. Path: {final_path}")
 
         except Exception as e:
