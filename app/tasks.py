@@ -12,6 +12,7 @@ from app.database import AsyncSessionLocal
 from app import crud, models
 from app import audio_generator_gtts as audio_generator
 from app import video_generator
+from app.video_generator import apply_camera_motion
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -325,23 +326,25 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
 
 async def process_semantic_video_generation(video_id: int):
     """
-    Semantic pipeline:
-      1) Generate master audio (and timestamps) with SpeechT5 engine.
-      2) Generate storyboard with durations using storyboard_engine.py.
-      3) For each scene: run animate_diff_engine.py to create frames.
-      4) Concatenate all frames in order, assemble with master audio.
-      5) Update DB and cleanup.
-    Expects engines to output JSON on stdout:
-      - speecht5_engine.py -> {"status":"COMPLETED","file": "...", "timestamps_file":"..."}  (timestamps_file optional)
-      - storyboard_engine.py -> {"status":"COMPLETED","storyboard":[{scene_description,animation_prompt,start_time,end_time,duration},...]}
-      - animate_diff_engine.py -> {"status":"COMPLETED","frame_paths":[...]}
+    Semantic pipeline V9.0 with Dynamic Camera Motion:
+      1) Generate master audio.
+      2) Generate storyboard with camera motion commands.
+      3) For each scene:
+         a) Run AnimateDiff to create base frames.
+         b) Apply camera motion to create transformed frames.
+      4) Concatenate all transformed frames, assemble with master audio.
+      5) Update DB and perform cleanup.
     """
-    logger.info(f"ORCHESTRATOR START video_id={video_id}")
+    logger.info(f"ORCHESTRATOR V9.0 START video_id={video_id}")
     audio_path: Optional[str] = None
     timestamps_path: Optional[str] = None
     final_video_path: Optional[str] = None
-    scene_temp_dirs: List[str] = []
-    all_frame_paths: List[str] = []
+    
+    # --- V9.0 CHANGE: We now need to track two kinds of temporary directories ---
+    scene_base_frame_dirs: List[str] = [] # For original AnimateDiff output
+    motion_temp_dir_objects: list = [] # For the transformed frames
+    all_final_frame_paths: List[str] = []
+
     async with AsyncSessionLocal() as db:
         try:
             video_record = await crud.get_video(db, video_id=video_id)
@@ -449,24 +452,35 @@ async def process_semantic_video_generation(video_id: int):
                 original_frame_paths = ad_json.get("frame_paths", [])
                 if not original_frame_paths: raise ValueError(f"No frames returned for scene {idx}")
 
-                except Exception as e:
-                    last_successful_frame_path = None
-                    raise RuntimeError(f"Invalid AnimateDiff output (scene {idx}). Error: {e}")
+                # --- V7 CORE LOGIC: Apply Camera Motion ---
+                motion_type = scene.get("camera_motion", "static")
+                
+                if motion_type != "static":
+                    temp_dir_obj, transformed_paths = await apply_camera_motion(original_frame_paths, motion_type)
+                    if temp_dir_obj: motion_temp_dir_objects.append(temp_dir_obj)
+                    all_final_frame_paths.extend(transformed_paths)
+                else:
+                    # If motion is static, just use the original frames directly
+                    all_final_frame_paths.extend(original_frame_paths)
+                # ---------------------------------------------
+                
+                # Use the middle frame of the ORIGINAL, untransformed sequence for continuity
+                last_successful_frame_path = original_frame_paths[len(original_frame_paths) // 2]
+                
+                # Update progress incrementally per scene
+                progress_per_scene = (80.0 - 40.0) / len(storyboard)
+                await update_progress(40.0 + (idx * progress_per_scene), f"Animated Scene {idx}/{len(storyboard)}")
 
-            # Stage 3: All scenes done → 80%
-            await update_progress(80.0, f"Animated {len(storyboard)} scenes")
 
             # ---------- 4) Assemble final video ----------
             final_video_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_video_{uid}.mp4")
             logger.info("ORCH: Assembling final video with master audio...")
             final_path = await video_generator.create_video_from_frames(
-                frame_paths=all_frame_paths,
+                frame_paths=all_final_frame_paths,
                 output_path=final_video_path,
                 audio_path=audio_path,
             )
-
-            # Stage 4: Assembly done → 90%
-            await update_progress(90.0, "Video assembled")
+            await update_progress(95.0, "Video assembled")
 
             # ---------- 5) Update DB ----------
             await crud.update_video_record(
@@ -481,16 +495,27 @@ async def process_semantic_video_generation(video_id: int):
             await db.rollback()
             vr = await crud.get_video(db, video_id=video_id)
             if vr:
-                vr.progress = 0.0  # Reset on failure
+                vr.progress = 0.0
                 await crud.update_video_record(db, video=vr, status=models.VideoStatus.FAILED, error_message=str(e))
                 await db.commit()
         finally:
-            # Cleanup intermediates (audio + per-scene dirs)
+            # --- V9.0 ROBUST CLEANUP ---
+            logger.info(f"ORCHESTRATOR CLEANUP for video_id={video_id}")
             if audio_path and os.path.exists(audio_path):
                 try: os.remove(audio_path)
                 except OSError as err: logger.error(f"Audio cleanup error: {err}")
-            for d in scene_temp_dirs:
+            
+            # Clean up original frame directories
+            for d in scene_base_frame_dirs:
                 if d and os.path.exists(d):
                     try: shutil.rmtree(d)
-                    except Exception as err: logger.error(f"Scene dir cleanup error: {err}")
+                    except Exception as err: logger.error(f"Base scene dir cleanup error: {err}")
+            
+            # Clean up transformed frame directories
+            for temp_dir_obj in motion_temp_dir_objects:
+                try:
+                    temp_dir_obj.cleanup()
+                except Exception as err:
+                    logger.error(f"Motion temp dir cleanup error for {temp_dir_obj.name}: {err}")
+
             logger.info(f"ORCHESTRATOR FINISHED video_id={video_id}")

@@ -74,8 +74,98 @@ def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[s
         else: lines.append(word)
     return lines
 
-def ease_out_cubic(t: float) -> float:
-    return 1 - pow(1 - t, 3)
+
+def ease_in_out_quad(t: float) -> float:
+    """A smooth easing function for motion."""
+    return 2 * t * t if t < 0.5 else 1 - pow(-2 * t + 2, 2) / 2
+
+async def apply_camera_motion(
+    frame_paths: List[str],
+    motion_type: str,
+    width: int = 512,  # Assuming default AnimateDiff dimensions
+    height: int = 512,
+    zoom_intensity: float = 0.20,  # 20% zoom
+    pan_intensity: float = 0.15,   # 15% pan
+) -> List[str, List[str]]:
+    """
+    Applies a digital camera motion to a list of frames.
+    Returns a tuple of (temporary_directory_path, new_frame_paths).
+    The caller is responsible for cleaning up the temporary directory.
+    """
+    if not frame_paths or motion_type == "static":
+        return None, frame_paths
+
+    num_frames = len(frame_paths)
+    logger.info(f"Applying '{motion_type}' motion to {num_frames} frames.")
+
+    # Create a new temporary directory to store the transformed frames
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="motion_frames_")
+    temp_dir_path = temp_dir_obj.name
+    new_frame_paths = []
+
+    # Use a non-blocking executor for the CPU-intensive image processing
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,  # Use default executor
+        _process_frames_for_motion,
+        frame_paths,
+        temp_dir_path,
+        new_frame_paths,
+        motion_type,
+        width,
+        height,
+        zoom_intensity,
+        pan_intensity,
+        num_frames
+    )
+
+    # Return the temp dir object itself to prevent it from being garbage collected
+    # The orchestrator will hold onto it and clean it up later.
+    return temp_dir_obj, new_frame_paths
+
+def _process_frames_for_motion(
+    frame_paths, temp_dir_path, new_frame_paths, motion_type, width, height,
+    zoom_intensity, pan_intensity, num_frames
+):
+    """Synchronous helper function that runs in the executor."""
+    for i, frame_path in enumerate(frame_paths):
+        progress = i / (num_frames - 1) if num_frames > 1 else 0
+        eased_progress = ease_in_out_quad(progress)
+
+        with Image.open(frame_path) as img:
+            if motion_type in ["slow_zoom_in", "slow_zoom_out"]:
+                if motion_type == "slow_zoom_out":
+                    eased_progress = 1 - eased_progress
+
+                # Calculate the crop box for zoom
+                final_w, final_h = width * (1 - zoom_intensity), height * (1 - zoom_intensity)
+                current_w = width - (width - final_w) * eased_progress
+                current_h = height - (height - final_h) * eased_progress
+
+                left = (width - current_w) / 2
+                top = (height - current_h) / 2
+                right = left + current_w
+                bottom = top + current_h
+                
+                transformed_img = img.crop((left, top, right, bottom)).resize((width, height), Image.LANCZOS)
+
+            elif motion_type in ["pan_left", "pan_right"]:
+                if motion_type == "pan_right":
+                    eased_progress = 1 - eased_progress
+
+                # Pan by cropping a moving window
+                crop_w = width * (1 - pan_intensity)
+                max_pan_offset = width - crop_w
+                pan_offset = max_pan_offset * eased_progress
+
+                transformed_img = img.crop((pan_offset, 0, pan_offset + crop_w, height)).resize((width, height), Image.LANCZOS)
+
+            else: # Fallback for unknown motion type
+                transformed_img = img.copy()
+
+            new_path = Path(temp_dir_path) / f"frame_{i:05d}.png"
+            transformed_img.save(new_path)
+            new_frame_paths.append(str(new_path))
 
 # ================= MAIN VIDEO GENERATOR ================= #
 async def create_typography_video(text: str, audio_path: str, output_path: str, author_name: str = None, style: str = "dark_gradient"):

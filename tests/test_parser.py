@@ -22,3 +22,4 @@ for p in prompts_to_test:
     print(f"[RESULT]: {parts}")
     assert "subject" in parts, "Parser failed to find a subject."
 print("\n--- ✅ All Parser Unit Tests Passed ---")
+

@@ -467,7 +467,17 @@ async def generate_semantic_video(
 
         # --- STEP 5: ENQUEUE THE JOB ---
         logger.info(f"Enqueuing semantic pipeline for video_id={new_video.id} linked to quote_id={target_quote.id}")
-        await redis.enqueue_job("generate_semantic_video_task", new_video.id)
+
+
+        await redis.enqueue_job(
+            "generate_semantic_video_task", 
+            new_video.id,
+            # Pass the new arguments to the task
+            style_hint=request.style_hint,
+            user_negative_prompt=request.negative_prompt,
+            voice_name=request.voice
+        )
+
 
         return {
             "message": "Semantic video generation has been enqueued.",

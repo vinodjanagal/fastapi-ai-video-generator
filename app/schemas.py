@@ -85,6 +85,15 @@ class SemanticVideoRequest(BaseModel):
     quote_text: Optional[str] = Field(None, description="The text of a new quote to create and generate a video for.")
     author_name: Optional[str] = Field(None, description="The name of the author for the new quote.")
 
+    # Allow the user to guide the overall visual style
+    style_hint: Optional[str] = None # e.g., "vintage film", "anime", "documentary"
+    
+    # Allow specifying a negative prompt to avoid unwanted elements
+    negative_prompt: Optional[str] = None # e.g., "hands", "text", "watermark"
+    
+    # Allow choosing the voice for narration
+    voice: str = "nova" # Default to a high-quality voice
+
     # This is a powerful Pydantic feature. It's a custom validator that checks the whole model at once.
     @model_validator(mode='before')
     def check_exclusive_fields(cls, values):
