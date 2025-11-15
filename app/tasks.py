@@ -324,26 +324,29 @@ async def process_video_generation_animatediff(video_id: int, prompt: str, voice
 # ---------- NEW: Semantic Orchestrator ----------
 
 
+
 async def process_semantic_video_generation(video_id: int):
     """
-    Semantic pipeline V9.0 with Dynamic Camera Motion:
+    Semantic pipeline V9.1 with Character Consistency & Dynamic Motion:
       1) Generate master audio.
-      2) Generate storyboard with camera motion commands.
-      3) For each scene:
-         a) Run AnimateDiff to create base frames.
-         b) Apply camera motion to create transformed frames.
-      4) Concatenate all transformed frames, assemble with master audio.
-      5) Update DB and perform cleanup.
+      2) Generate storyboard with character sheet & camera motions.
+      3) PRE-PRODUCTION: Generate a master character reference image.
+      4) For each scene:
+         a) Run AnimateDiff, using the MASTER reference image for IP-Adapter.
+         b) Apply camera motion to the generated frames.
+      5) Assemble final video and clean up all assets.
     """
-    logger.info(f"ORCHESTRATOR V9.0 START video_id={video_id}")
+    logger.info(f"ORCHESTRATOR V9.1 START video_id={video_id}")
+    
+    # --- Asset Path Management ---
     audio_path: Optional[str] = None
     timestamps_path: Optional[str] = None
     final_video_path: Optional[str] = None
+    character_reference_image_path: Optional[str] = None
     
-    # --- V9.0 CHANGE: We now need to track two kinds of temporary directories ---
-    scene_base_frame_dirs: List[str] = [] # For original AnimateDiff output
-    motion_temp_dir_objects: list = [] # For the transformed frames
-    all_final_frame_paths: List[str] = []
+    # --- Cleanup Management ---
+    cleanup_dirs: List[str] = []
+    motion_temp_dir_objects: list = []
 
     async with AsyncSessionLocal() as db:
         try:
@@ -351,14 +354,6 @@ async def process_semantic_video_generation(video_id: int):
             if not video_record:
                 raise FileNotFoundError(f"Video {video_id} not found.")
             
-            quote_text_for_logging = video_record.quote.text
-            logger.info(f"STARTING JOB FOR QUOTE: \"{quote_text_for_logging}\"")
-
-            video_record.status = models.VideoStatus.PROCESSING
-            video_record.progress = 0.0
-            await db.merge(video_record)
-            await db.commit()
-
             async def update_progress(percent: float, step_name: str):
                 video_record.progress = round(percent, 1)
                 video_record.status = f"PROCESSING: {step_name}"
@@ -366,20 +361,21 @@ async def process_semantic_video_generation(video_id: int):
                 await db.commit()
                 bar = "█" * int(percent // 10) + "░" * (10 - int(percent // 10))
                 logger.info(f"PROGRESS: [{bar}] {percent:.1f}% - {step_name}")
-                
+
+            await update_progress(0.0, "Initializing...")
+            
             quote_text = video_record.quote.text
             uid = uuid.uuid4()
 
-            # ---------- 1) Speech (master audio + timestamps) ----------
-            # This section remains unchanged.
+            # ---------- 1) Speech Generation ----------
+            await update_progress(5.0, "Generating audio...")
             audio_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_audio_{uid}.mp3")
             speech_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "speecht5_engine.py")
-            with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt", encoding='utf-8') as text_file:
-                text_file.write(quote_text)
-                text_file_path = text_file.name
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt", encoding='utf-8') as tf:
+                tf.write(quote_text)
+                text_file_path = tf.name
             try:
                 speech_cmd = [sys.executable, speech_script, "--text-file", text_file_path, "--output-path", audio_path]
-                logger.info("ORCH: Running SpeechT5 (audio)...")
                 rc, out, err = await run_subprocess_streamed(speech_cmd, timeout=SPEECH_TIMEOUT)
                 if rc != 0: raise RuntimeError(f"speecht5_engine.py failed (rc={rc}). Stderr:\n{err}")
                 speech_json = json.loads(out)
@@ -387,102 +383,96 @@ async def process_semantic_video_generation(video_id: int):
                 timestamps_path = speech_json.get("timestamps_file")
             finally:
                 if os.path.exists(text_file_path): os.remove(text_file_path)
+            await update_progress(15.0, "Audio generated")
 
-            await update_progress(20.0, "Audio generated")
-
-            # ---------- 2) Storyboard (with durations & camera motion) ----------
-            # This section remains unchanged.
+            # ---------- 2) Storyboard Generation ----------
+            await update_progress(20.0, "Directing scenes...")
             storyboard_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "storyboard_engine.py")
             storyboard_cmd = [sys.executable, storyboard_script, "--quote", quote_text]
             if timestamps_path: storyboard_cmd += ["--timestamps", timestamps_path]
-            logger.info("ORCH: Running Storyboard engine...")
             rc2, out2, err2 = await run_subprocess_streamed(storyboard_cmd, timeout=STORYBOARD_TIMEOUT)
             if rc2 != 0: raise RuntimeError(f"storyboard_engine.py failed (rc={rc2}). Stderr:\n{err2}")
-            sb_json = json.loads(out2)
-            if sb_json.get("status") != "COMPLETED": raise ValueError(sb_json.get("error", "Storyboard engine error"))
-            storyboard = sb_json.get("storyboard", [])
-            if not storyboard: raise ValueError("Storyboard returned empty.")
+            
+            storyboard_data = json.loads(out2).get("storyboard_data", {})
+            storyboard_scenes = storyboard_data.get("scenes", [])
+            character_sheet_prompt = storyboard_data.get("character_sheet")
+            if not storyboard_scenes: raise ValueError("Storyboard returned no scenes.")
+            await update_progress(25.0, "Storyboard created")
 
-            await update_progress(40.0, "Storyboard created")
-
-            # ---------- 3) Per-scene Frame Generation & Motion Application ----------
+            # ---------- 3) PRE-PRODUCTION: The Casting Call ----------
             ad_script = os.path.join(PROJECT_ROOT, "app", "video_engines", "animate_diff_engine.py")
+            if character_sheet_prompt:
+                await update_progress(30.0, "Casting character...")
+                char_sheet_dir = os.path.join(VIDEO_OUTPUT_DIR, f"character_sheet_{uid.hex}")
+                cleanup_dirs.append(char_sheet_dir)
+
+                logger.info(f"ORCH: Generating master character reference from prompt: {character_sheet_prompt}")
+                char_cmd = [
+                    sys.executable, ad_script,
+                    "--prompt", f"{character_sheet_prompt}, {BASE_QUALITY_PROMPT}",
+                    "--negative-prompt", BASE_NEGATIVE_PROMPT,
+                    "--output-dir", char_sheet_dir, "--num-frames", "1",
+                    "--num-steps", "25", "--guidance-scale", "7.0"
+                ]
+                rc_char, out_char, err_char = await run_subprocess_streamed(char_cmd, timeout=AD_FRAME_TIMEOUT)
+                if rc_char != 0: raise RuntimeError(f"Character sheet generation failed. Stderr:\n{err_char}")
+                
+                char_json = json.loads(out_char)
+                if char_json.get("status") != "COMPLETED": raise ValueError("Character sheet engine failed.")
+                char_frame_paths = char_json.get("frame_paths", [])
+                if not char_frame_paths: raise ValueError("Character sheet returned no frames.")
+                character_reference_image_path = char_frame_paths[0]
+                logger.info(f"✅ Master character reference CREATED: {character_reference_image_path}")
+            
+            # ---------- 4) PRODUCTION: Scene-by-Scene Rendering ----------
             last_successful_frame_path: Optional[str] = None
+            all_final_frame_paths: List[str] = []
 
-            for idx, scene in enumerate(storyboard, start=1):
-                description = scene.get("description", "")
+            for idx, scene in enumerate(storyboard_scenes, start=1):
+                progress_start = 35.0
+                progress_range = 90.0 - progress_start
+                scene_progress = progress_start + ((idx - 1) / len(storyboard_scenes)) * progress_range
+                await update_progress(scene_progress, f"Rendering Scene {idx}/{len(storyboard_scenes)}")
+
                 composition = scene.get("composition", {})
-                if not description or not composition:
-                    raise ValueError(f"Scene {idx} is missing 'description' or 'composition'")
-
-                final_positive_prompt = (
-                    f"{description}. "
-                    f"{composition.get('camera', '')}. "
-                    f"Scene set in {composition.get('environment', '')}, "
-                    f"with {composition.get('lighting', '')} lighting. "
-                    f"Visual style: {composition.get('style', '')}. "
-                    f"{BASE_QUALITY_PROMPT}"
-                )
-                final_negative_prompt = BASE_NEGATIVE_PROMPT
-
-                logger.info(f"[Scene {idx}/{len(storyboard)}] PROMPT: {final_positive_prompt[:150]}...")
-
-                # --- Generate Base Frames ---
+                final_positive_prompt = f"{scene.get('description', '')}. {composition.get('camera', '')}. Scene set in {composition.get('environment', '')}, with {composition.get('lighting', '')} lighting. Visual style: {composition.get('style', '')}. {BASE_QUALITY_PROMPT}"
+                
                 base_frames_dir = os.path.join(VIDEO_OUTPUT_DIR, f"scene_{idx}_base_{uid.hex}")
-                scene_base_frame_dirs.append(base_frames_dir)
+                cleanup_dirs.append(base_frames_dir)
                 
                 ad_cmd = [
-                    sys.executable, ad_script,
-                    "--prompt", final_positive_prompt,
-                    "--negative-prompt", final_negative_prompt,
-                    "--output-dir", base_frames_dir,
-                    "--base-model", "SG161222/Realistic_Vision_V5.1_noVAE",
-                    "--num-steps", str(V2_CLASSIC_STEPS),
-                    "--guidance-scale", str(V2_CLASSIC_GUIDANCE)
+                    sys.executable, ad_script, "--prompt", final_positive_prompt,
+                    "--negative-prompt", BASE_NEGATIVE_PROMPT, "--output-dir", base_frames_dir,
+                    "--num-steps", str(V2_CLASSIC_STEPS), "--guidance-scale", str(V2_CLASSIC_GUIDANCE),
                 ]
-                if last_successful_frame_path:
+
+                if character_reference_image_path:
+                    ad_cmd.extend(["--ip-adapter-image-path", character_reference_image_path, "--ip-adapter-scale", "0.55"])
+                elif last_successful_frame_path:
                     ad_cmd.extend(["--ip-adapter-image-path", last_successful_frame_path, "--ip-adapter-scale", str(V2_IP_ADAPTER_SCALE)])
                 
                 rc3, out3, err3 = await run_subprocess_streamed(ad_cmd, timeout=AD_FRAME_TIMEOUT)
-                if rc3 != 0: raise RuntimeError(f"animate_diff_engine.py failed (scene {idx}) rc={rc3}. Stderr:\n{err3}")
-
-                ad_json = json.loads(out3)
-                if ad_json.get("status") != "COMPLETED": raise ValueError(ad_json.get("error", f"AnimateDiff scene {idx} error"))
+                if rc3 != 0: raise RuntimeError(f"AnimateDiff failed (scene {idx}). Stderr:\n{err3}")
                 
-                original_frame_paths = ad_json.get("frame_paths", [])
+                original_frame_paths = json.loads(out3).get("frame_paths", [])
                 if not original_frame_paths: raise ValueError(f"No frames returned for scene {idx}")
 
-                # --- V7 CORE LOGIC: Apply Camera Motion ---
                 motion_type = scene.get("camera_motion", "static")
-                
                 if motion_type != "static":
                     temp_dir_obj, transformed_paths = await apply_camera_motion(original_frame_paths, motion_type)
                     if temp_dir_obj: motion_temp_dir_objects.append(temp_dir_obj)
                     all_final_frame_paths.extend(transformed_paths)
                 else:
-                    # If motion is static, just use the original frames directly
                     all_final_frame_paths.extend(original_frame_paths)
-                # ---------------------------------------------
                 
-                # Use the middle frame of the ORIGINAL, untransformed sequence for continuity
                 last_successful_frame_path = original_frame_paths[len(original_frame_paths) // 2]
-                
-                # Update progress incrementally per scene
-                progress_per_scene = (80.0 - 40.0) / len(storyboard)
-                await update_progress(40.0 + (idx * progress_per_scene), f"Animated Scene {idx}/{len(storyboard)}")
 
-
-            # ---------- 4) Assemble final video ----------
+            # ---------- 5) POST-PRODUCTION: Assembly & Finalize ----------
+            await update_progress(95.0, "Assembling video...")
             final_video_path = os.path.join(VIDEO_OUTPUT_DIR, f"semantic_video_{uid}.mp4")
-            logger.info("ORCH: Assembling final video with master audio...")
             final_path = await video_generator.create_video_from_frames(
-                frame_paths=all_final_frame_paths,
-                output_path=final_video_path,
-                audio_path=audio_path,
+                frame_paths=all_final_frame_paths, output_path=final_video_path, audio_path=audio_path,
             )
-            await update_progress(95.0, "Video assembled")
-
-            # ---------- 5) Update DB ----------
             await crud.update_video_record(
                 db, video=video_record, status=models.VideoStatus.COMPLETED, video_path=final_path
             )
@@ -499,23 +489,17 @@ async def process_semantic_video_generation(video_id: int):
                 await crud.update_video_record(db, video=vr, status=models.VideoStatus.FAILED, error_message=str(e))
                 await db.commit()
         finally:
-            # --- V9.0 ROBUST CLEANUP ---
             logger.info(f"ORCHESTRATOR CLEANUP for video_id={video_id}")
             if audio_path and os.path.exists(audio_path):
                 try: os.remove(audio_path)
-                except OSError as err: logger.error(f"Audio cleanup error: {err}")
+                except OSError: pass
             
-            # Clean up original frame directories
-            for d in scene_base_frame_dirs:
+            for d in cleanup_dirs:
                 if d and os.path.exists(d):
                     try: shutil.rmtree(d)
-                    except Exception as err: logger.error(f"Base scene dir cleanup error: {err}")
+                    except Exception: pass
             
-            # Clean up transformed frame directories
             for temp_dir_obj in motion_temp_dir_objects:
-                try:
-                    temp_dir_obj.cleanup()
-                except Exception as err:
-                    logger.error(f"Motion temp dir cleanup error for {temp_dir_obj.name}: {err}")
-
+                try: temp_dir_obj.cleanup()
+                except Exception: pass
             logger.info(f"ORCHESTRATOR FINISHED video_id={video_id}")

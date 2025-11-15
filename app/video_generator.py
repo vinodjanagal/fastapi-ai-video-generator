@@ -2,7 +2,7 @@
 import asyncio
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional,Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from moviepy import ImageSequenceClip, AudioFileClip
@@ -86,7 +86,7 @@ async def apply_camera_motion(
     height: int = 512,
     zoom_intensity: float = 0.20,  # 20% zoom
     pan_intensity: float = 0.15,   # 15% pan
-) -> List[str, List[str]]:
+) -> Tuple[str, List[str]]:
     """
     Applies a digital camera motion to a list of frames.
     Returns a tuple of (temporary_directory_path, new_frame_paths).

@@ -1,0 +1,28 @@
+{
+  "storyboard_data": {
+    "character_sheet": "photorealistic portrait of a stoic Roman emperor, detailed face, cinematic lighting",
+    "scenes": [
+      {
+        "description": "An emperor stands on a balcony, looking over the city of Rome.",
+        "composition": {
+          "camera": "wide shot, from behind",
+          "lighting": "golden hour sunlight",
+          "environment": "ancient Roman balcony, city in background",
+          "style": "photorealistic, cinematic"
+        },
+        "camera_motion": "slow_zoom_in"
+      },
+      {
+        "description": "A close-up of a hand writing on a scroll with a quill.",
+        "composition": {
+          "camera": "extreme close-up on the quill tip",
+          "lighting": "candlelight, high contrast",
+          "environment": "a scholar's desk",
+          "style": "macro photography, detailed"
+        },
+        "camera_motion": "pan_right"
+      }
+    ]
+  },
+  "status": "COMPLETED"
+}
