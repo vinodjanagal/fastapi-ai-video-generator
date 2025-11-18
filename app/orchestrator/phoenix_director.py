@@ -1,16 +1,19 @@
-# app/orchestrator/phoenix_director.py
-
 from __future__ import annotations
+import asyncio
 import os
 import json
 import uuid
 import logging
 from typing import Optional, Literal, Dict, Any, List
+
 from dataclasses import dataclass, field
 
-from app.tasks import run_subprocess_streamed
+# subprocess runner (2-value return)
+from app.utils import run_subprocess_with_realtime_progress
+
+# “brain” modules
 from app.engine.parser import semantic_parser
-from app.engine.prompt_builder import build_semantic_prompt
+from app.engine.prompt_builder import build_semantic_prompt, BASE_NEGATIVE_PROMPT
 from app.engine.character_sheet import build_character_prompt
 from app.engine.cinematics import classify_shot_type
 
@@ -18,43 +21,29 @@ logger = logging.getLogger("phoenix.director")
 logger.setLevel(logging.INFO)
 
 
-# ------------------------------------------------------
-# DATA CLASSES
-# ------------------------------------------------------
+# ------------------------------
+# Data Classes
+# ------------------------------
 @dataclass
 class Scene:
     index: int
     description: str
     composition: Dict[str, Any]
-    duration: float = 0.0
-    start_time: float = 0.0
-    end_time: float = 0.0
+    camera_motion: str = "static"
 
 
 @dataclass
 class VideoContext:
     uid: str
     quote_text: str
-    video_id: Optional[int] = None
-    audio_path: Optional[str] = None
-    timestamps_path: Optional[str] = None
     scene_dirs: List[str] = field(default_factory=list)
 
 
-# ------------------------------------------------------
-# PHOENIX DIRECTOR (DRY-RUN + PRODUCTION)
-# ------------------------------------------------------
+# ============================================================
+# PhoenixDirector V10.6 — Stable CPU Version
+# (Init-Image continuity only — correct for AnimateDiff)
+# ============================================================
 class PhoenixDirector:
-    """
-    Phoenix V9.3 Director:
-    -------------------------------------------
-    • Identical brain for production & dry-run
-    • Uses semantic_parser, classify_shot_type,
-      build_semantic_prompt, build_character_prompt.
-    • Dry-run produces a FAST character preview
-      using lightweight settings.
-    """
-
     def __init__(
         self,
         project_root: str,
@@ -64,156 +53,233 @@ class PhoenixDirector:
     ):
         self.project_root = project_root
         self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
         self.mode = mode
         self.seed = seed
         self.ctx: Optional[VideoContext] = None
 
-        # Golden Defaults
+        # Stable settings for CPU AnimateDiff
         self.defaults = {
             "production": {
-                "num_steps": 22,
+                "num_steps": 20,
                 "guidance_scale": 6.0,
                 "num_frames": 16,
-                "width": 512,
-                "height": 512,
-                "ip_scale": 0.55,
+                "width": 384,
+                "height": 384,
+                "init_strength": 0.55,   # best identity retention on CPU
             },
             "dry_run": {
                 "num_steps": 20,
                 "guidance_scale": 7.0,
-                "num_frames": 12,
+                "num_frames": 4,
                 "width": 384,
                 "height": 384,
-                "ip_scale": 0.10,
             },
         }
 
+        self.engine_script = os.path.join(
+            self.project_root,
+            "app",
+            "video_engines",
+            "animate_diff_engine.py",
+        )
+
     def _conf(self):
-        return self.defaults["dry_run"] if self.mode == "dry_run" else self.defaults["production"]
+        return self.defaults[self.mode]
 
-
-    # ------------------------------------------------------
-    # DRY RUN ENTRYPOINT
-    # ------------------------------------------------------
-    async def dry_run_from_text(self, quote_text: str) -> Optional[str]:
-        """
-        Phoenix V9.3 DRY-RUN:
-        • Calls storyboard_engine
-        • Builds scene prompts using the REAL Cinematic Brain
-        • Builds CHARACTER PROMPT using character_sheet logic
-        • Generates ONE preview frame from AnimateDiff
-        """
-
-        logger.info(f"Phoenix dry_run start (mode={self.mode})")
-        self.ctx = VideoContext(uid=uuid.uuid4().hex, quote_text=quote_text)
-
-        # --------------------------------------------------
-        # 1) RUN STORYBOARD ENGINE (LLM → Scenes + Character)
-        # --------------------------------------------------
-        storyboard_script = os.path.join(
-            self.project_root, "app", "video_engines", "storyboard_engine.py"
+    # ---------------------------------------------------------
+    # DRY RUN (fast preview)
+    # ---------------------------------------------------------
+    async def dry_run_from_text(self, text: str) -> Dict[str, Any]:
+        sb_script = os.path.join(
+            self.project_root,
+            "app",
+            "video_engines",
+            "storyboard_engine.py",
         )
 
-        sb_cmd = [os.sys.executable, storyboard_script, "--quote", quote_text]
-
-        rc, out, err = await run_subprocess_streamed(sb_cmd)
+        rc, out = await run_subprocess_with_realtime_progress(
+            [os.sys.executable, sb_script, "--quote", text],
+            timeout_per_line=7200
+        )
         if rc != 0:
-            logger.error(f"Storyboard engine failed: {err}")
-            return None
+            raise RuntimeError("Storyboard failed in dry_run.")
 
-        try:
-            parsed = json.loads(out)
+        return json.loads(out).get("storyboard_data", {})
 
-            # Scenes: accept several possible formats
-            scenes = (
-                parsed.get("scenes")
-                or parsed.get("storyboard")
-                or (parsed.get("storyboard_data") or {}).get("scenes")
-            )
+    # ---------------------------------------------------------
+    # FULL RENDER PIPELINE
+    # ---------------------------------------------------------
+    async def render_video(self, quote_text: str):
+        logger.info("=== PhoenixDirector V10.6 RENDER START ===")
 
-            character_sheet_prompt = (
-                parsed.get("character_sheet")
-                or parsed.get("character_sheet_prompt")
-                or (parsed.get("storyboard_data") or {}).get("character_sheet")
-            )
-
-            if not scenes:
-                logger.error("Storyboard returned no scenes.")
-                return None
-
-        except Exception as e:
-            logger.error(f"Failed to parse storyboard JSON: {e}")
-            logger.error(f"STDOUT:\n{out}")
-            return None
-
-        # --------------------------------------------------
-        # 2) BUILD PRODUCTION-IDENTICAL PROMPTS (Brain)
-        # --------------------------------------------------
-        logger.info("Cinematic Brain prompts (dry-run preview):")
-        for idx, scene in enumerate(scenes, start=1):
-            desc = scene.get("description", "")
-            sem = semantic_parser(desc)
-            shot = classify_shot_type(desc, sem)
-            pos, neg = build_semantic_prompt(desc, "", shot, sem)
-
-            logger.info(f"[Scene {idx}] {pos[:300]}")
-
-        # --------------------------------------------------
-        # 3) CHARACTER PROMPT (SPECIAL BUILDER)
-        # --------------------------------------------------
-        if not character_sheet_prompt:
-            logger.warning("No character sheet prompt detected.")
-            return None
-
-        final_char_pos, final_char_neg = build_character_prompt(character_sheet_prompt)
-
-        logger.info(f"Character Sheet Prompt:\n{final_char_pos}")
-        logger.info(f"Character Sheet NEG:\n{final_char_neg}")
-
-        # --------------------------------------------------
-        # 4) RUN ANIMATE DIFF ENGINE (FAST PREVIEW)
-        # --------------------------------------------------
+        self.ctx = VideoContext(uid=uuid.uuid4().hex, quote_text=quote_text)
         conf = self._conf()
-        ad_script = os.path.join(
-            self.project_root, "app", "video_engines", "animate_diff_engine.py"
+
+        # --------------------------------------------------------------------
+        # 1. STORYBOARD
+        # --------------------------------------------------------------------
+        sb_script = os.path.join(
+            self.project_root,
+            "app",
+            "video_engines",
+            "storyboard_engine.py",
         )
 
-        char_dir = os.path.join(self.output_dir, f"dry_character_{self.ctx.uid}")
-        os.makedirs(char_dir, exist_ok=True)
+        rc, out = await run_subprocess_with_realtime_progress(
+            [os.sys.executable, sb_script, "--quote", quote_text],
+            timeout_per_line=7200
+        )
+        if rc != 0:
+            raise RuntimeError("Storyboard engine failed.")
 
-        ad_cmd = [
-            os.sys.executable,
-            ad_script,
-            "--prompt", final_char_pos,
-            "--negative-prompt", final_char_neg,
-            "--output-dir", char_dir,
-            "--num-steps", str(conf["num_steps"]),
-            "--guidance-scale", str(conf["guidance_scale"]),
-            "--num-frames", str(conf["num_frames"]),
-            "--width", str(conf["width"]),
-            "--height", str(conf["height"]),
-            "--seed", str(self.seed),
+        sb_data = json.loads(out).get("storyboard_data", {})
+        scenes_raw = sb_data.get("scenes", [])
+        char_sheet_src = sb_data.get("character_sheet")
+
+        if not scenes_raw:
+            raise RuntimeError("Storyboard produced no scenes")
+
+        scenes = [
+            Scene(
+                index=i,
+                description=s["description"],
+                composition=s.get("composition", {}),
+                camera_motion=s.get("camera_motion", "static"),
+            )
+            for i, s in enumerate(scenes_raw)
         ]
 
-        logger.info("Calling AnimateDiff for dry-run preview...")
-        rc2, out2, err2 = await run_subprocess_streamed(ad_cmd)
+        # --------------------------------------------------------------------
+        # 2. CHARACTER SHEET  →  first continuity frame
+        # --------------------------------------------------------------------
+        last_frame = None
 
-        if rc2 != 0:
-            logger.error(f"AnimateDiff dry-run failed: {err2}")
-            return None
+        if char_sheet_src:
+            pos, neg = build_character_prompt(char_sheet_src)
 
-        try:
-            parsed_ad = json.loads(out2)
-            frame_paths = parsed_ad.get("frame_paths", [])
-            if not frame_paths:
-                logger.error("AnimateDiff returned no frames.")
-                return None
+            out_dir = os.path.join(
+                self.output_dir,
+                f"character_sheet_{self.ctx.uid}",
+            )
+            self.ctx.scene_dirs.append(out_dir)
 
-            preview_path = frame_paths[0]
-            logger.info(f"Dry-run preview ready: {preview_path}")
-            return preview_path
+            cmd = [
+                os.sys.executable,
+                self.engine_script,
+                "--prompt", pos,
+                "--negative-prompt", neg,
+                "--output-dir", out_dir,
+                "--num-frames", "12",
+                "--num-steps", "25",
+                "--width", str(conf["width"]),
+                "--height", str(conf["height"]),
+                "--seed", str(self.seed),
+                "--base-model", "SG161222/Realistic_Vision_V5.1_noVAE",
+            ]
 
-        except Exception as e:
-            logger.error(f"Failed to parse AnimateDiff output: {e}")
-            logger.error(f"STDOUT:\n{out2}")
-            return None
+            rc2, out2 = await run_subprocess_with_realtime_progress(cmd, timeout_per_line=7200)
+            if rc2 != 0:
+                raise RuntimeError("Character sheet render failed")
+
+            js = json.loads(out2)
+            fp = js.get("frame_paths", [])
+            last_frame = fp[0] if fp else None
+
+        # --------------------------------------------------------------------
+        # 3. SCENE RENDERING (Init-Image continuity ONLY)
+        # --------------------------------------------------------------------
+        scene_defs: List[Dict[str, Any]] = []
+
+        for scene in scenes:
+            desc = scene.description
+
+            sem = semantic_parser(desc)
+            shot = classify_shot_type(desc, sem)
+
+            pos, neg = build_semantic_prompt(
+                desc,
+                BASE_NEGATIVE_PROMPT,
+                shot,
+                sem,
+                scene.index,
+                len(scenes),
+            )
+
+            out_dir = os.path.join(
+                self.output_dir,
+                f"scene_{scene.index + 1}_{self.ctx.uid}",
+            )
+            self.ctx.scene_dirs.append(out_dir)
+
+            cmd = [
+                os.sys.executable,
+                self.engine_script,
+                "--prompt", pos,
+                "--negative-prompt", neg,
+                "--output-dir", out_dir,
+                "--num-steps", str(conf["num_steps"]),
+                "--guidance-scale", str(conf["guidance_scale"]),
+                "--num-frames", str(conf["num_frames"]),
+                "--width", str(conf["width"]),
+                "--height", str(conf["height"]),
+                "--seed", str(self.seed + scene.index + 1),
+                "--base-model", "SG161222/Realistic_Vision_V5.1_noVAE",
+            ]
+
+            # -------------------------------------------------------------
+            # CONTINUITY ENGINE (Stable AnimateDiff Version)
+            # -------------------------------------------------------------
+            if last_frame:
+                cmd += [
+                    "--init-image", last_frame,
+                    "--strength", str(conf["init_strength"]),
+                ]
+
+            rc3, out3 = await run_subprocess_with_realtime_progress(cmd, timeout_per_line=7200)
+            if rc3 != 0:
+                logger.warning(f"Scene {scene.index + 1} failed — skipping.")
+                continue
+
+            js = json.loads(out3)
+            frames = js.get("frame_paths", [])
+            if frames:
+                last_frame = frames[-1]
+
+            scene_defs.append({
+                "description": scene.description,
+                "camera_motion": scene.camera_motion,
+            })
+
+        # --------------------------------------------------------------------
+        # RETURN METADATA TO run_full_video.py
+        # --------------------------------------------------------------------
+        return {
+            "scene_dirs": self.ctx.scene_dirs,
+            "scenes": scene_defs,
+        }
+
+
+# ---------------------------------------------------------
+# CLI (optional)
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--quote", required=True)
+    parser.add_argument("--mode", choices=["production", "dry_run"], default="dry_run")
+    parser.add_argument("--output-dir", default="phoenix_output")
+    args = parser.parse_args()
+
+    async def _run():
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        d = PhoenixDirector(project_root=root, output_dir=args.output_dir, mode=args.mode)
+        if args.mode == "dry_run":
+            prev = await d.dry_run_from_text(args.quote)
+            print(json.dumps(prev, indent=2))
+        else:
+            out = await d.render_video(args.quote)
+            print(json.dumps(out, indent=2))
+
+    asyncio.run(_run())

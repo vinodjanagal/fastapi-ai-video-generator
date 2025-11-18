@@ -1,51 +1,141 @@
 # app/engine/character_sheet.py
-from typing import Tuple
+import re
 import logging
-from app.engine.parser import semantic_parser
-from app.engine.prompt_builder import BASE_QUALITY_PROMPT, BASE_NEGATIVE_PROMPT
+from typing import Tuple
 
-logger = logging.getLogger("v9_character_sheet")
+from app.engine.prompt_builder import (
+    BASE_QUALITY_PROMPT,
+    BASE_NEGATIVE_PROMPT,
+    ANTI_EYE_NEG,
+)
 
-def _is_sentence_like(text: str) -> bool:
-    # If the character sheet text contains a verb or comma-separated descriptors, treat more carefully
-    if not text: return False
-    if len(text.split()) > 12:  # longer description -> may be narrative
-        return True
-    # short prompts like "photorealistic portrait of..." -> not sentence-like
-    if any(c in text for c in [".", ";"]):
-        return True
-    return False
+logger = logging.getLogger("phoenix.character_sheet")
 
+
+# --------------------------------------------
+# Utility cleaning functions
+# --------------------------------------------
+REMOVE_PREFIXES = [
+    r"^photorealistic\s+portrait\s+of\s+",
+    r"^portrait\s+of\s+",
+    r"^a\s+portrait\s+of\s+",
+    r"^an\s+portrait\s+of\s+",
+    r"^digital\s+portrait\s+of\s+",
+]
+
+ACTION_VERBS = [
+    "holding", "hunched", "working", "studying",
+    "finding", "leaning", "looking", "reading",
+    "standing", "sitting", "focused", "examining",
+]
+
+ENV_WORDS = [
+    "workshop", "room", "bench", "table", "forest", "field",
+    "background", "scene", "environment", "landscape",
+    "setting", "laboratory", "office", "street",
+]
+
+CAMERA_WORDS = [
+    "close-up", "medium shot", "wide shot",
+    "shot", "view", "angle",
+]
+
+LIGHT_WORDS = [
+    "warm light", "lamp light", "soft light",
+    "shadow", "lighting", "sunlight",
+]
+
+NO_IDENTITY_WORDS = [
+    "expression", "focused", "emotion", "pose", "gesture",
+]
+
+
+def _remove_prefixes(text: str) -> str:
+    clean = text.strip()
+    for p in REMOVE_PREFIXES:
+        clean = re.sub(p, "", clean, flags=re.I).strip()
+    return clean
+
+def _remove_trailing_noise(words: list) -> list:
+    cleaned = []
+    for w in words:
+        lw = w.lower()
+        if any(lw.startswith(v) for v in ACTION_VERBS):
+            continue
+        if any(lw == e for e in ENV_WORDS):
+            continue
+        if any(lw in c for c in CAMERA_WORDS):
+            continue
+        if any(lw in l for l in LIGHT_WORDS):
+            continue
+        if lw in NO_IDENTITY_WORDS:
+            continue
+        cleaned.append(w)
+    return cleaned
+
+def _clean_subject(raw: str) -> str:
+    """Extract a clean identity string from raw LLM text."""
+    if not raw:
+        return "person"
+
+    raw = _remove_prefixes(raw)
+
+    # Break into words for cleanup
+    words = re.split(r"[,\s]+", raw)
+    words = [w.strip() for w in words if w.strip()]
+
+    words = _remove_trailing_noise(words)
+
+    if not words:
+        return "person"
+
+    # Reconstruct subject
+    subject = " ".join(words)
+
+    # Remove accidental duplicates
+    subject = re.sub(r"\b(\w+)( \1\b)+", r"\1", subject, flags=re.I)
+
+    # Clamp length for portrait stability
+    subject = " ".join(subject.split()[:12])
+
+    return subject.strip()
+
+
+# --------------------------------------------
+# MAIN BUILDER
+# --------------------------------------------
 def build_character_prompt(raw: str) -> Tuple[str, str]:
     """
-    Build a stable character prompt:
-      - If raw looks like a sentence (long), we run minimal parsing to extract subject.
-      - If raw is a short descriptor ("photorealistic portrait of a wise man"), we DO NOT semantic-parse aggressively;
-        we anchor the subject and append quality tokens.
+    Phoenix V10 – Production Character Sheet Builder
+    ------------------------------------------------
+    - Extracts identity only
+    - Removes environment / actions / camera words
+    - Always output human/creature face identity
+    - Safe studio portrait lighting
+    - Bulletproof negative prompt
     """
+
     if not raw:
-        raise ValueError("Empty character sheet prompt")
+        raise ValueError("Character sheet text is empty")
 
-    if _is_sentence_like(raw):
-        # mild parsing
-        parts = semantic_parser(raw)
-        subject = parts.get("subject") or raw
-    else:
-        # short descriptor: try to find the 'of <subject>' pattern or human hint fallback
-        import re
-        m = re.search(r"of\s+([A-Za-z ,]+)$", raw, flags=re.I)
-        if m:
-            subject = m.group(1).strip()
-        else:
-            # fallback: entire raw without style tokens (strip 'photorealistic', 'portrait')
-            subject = raw
-            subject = subject.replace("photorealistic", "").replace("portrait", "").strip()
+    # 1. Extract identity
+    subject = _clean_subject(raw)
 
-    # Compose prompt conservatively
-    # Ensure subject is explicit (e.g., "wise old Japanese martial artist")
-    final_prompt = f"photorealistic portrait of {subject}, calm expression, detailed wrinkles, cinematic lighting, soft studio lighting, {BASE_QUALITY_PROMPT}"
-    # Strong negative to avoid macro eye or extreme crop
-    final_negative = f"{BASE_NEGATIVE_PROMPT}, macro eye close-up, extreme close-up, cropped face, iris detail"
+    logger.info(f"[CharacterSheet] Identity extracted: {subject}")
 
-    logger.info(f"Character prompt built: {final_prompt}")
-    return final_prompt, final_negative
+    # 2. Final positive portrait prompt
+    final_pos = (
+        f"photorealistic portrait of {subject}, "
+        f"cinematic lighting, soft studio lighting, "
+        f"detailed facial features, {BASE_QUALITY_PROMPT}"
+    )
+
+    # 3. Final negative prompt
+    final_neg = (
+        f"{BASE_NEGATIVE_PROMPT}, {ANTI_EYE_NEG}, "
+        f"cropped face, warped face, distorted eyes"
+    )
+
+    logger.info(f"[CharacterSheet] Final Prompt: {final_pos}")
+
+    return final_pos, final_neg

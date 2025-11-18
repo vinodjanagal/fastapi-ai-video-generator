@@ -1,130 +1,106 @@
 # app/engine/parser.py
-from typing import Dict, Optional
 import logging
-import spacy
 import re
+from typing import Dict, Any, Optional
 
-logger = logging.getLogger("v7_parser")
+logger = logging.getLogger("phoenix.parser")
+logger.setLevel(logging.INFO)
+
+# try to import spaCy; if not present, we fallback to a light parser
+try:
+    import spacy
+    _SPACY_AVAILABLE = True
+except Exception:
+    _SPACY_AVAILABLE = False
+
 
 def _load_spacy_model():
-    """Loads the spaCy model with optimized pipes for our use case."""
+    """
+    Load spaCy model once. If not available, raise; caller may fallback.
+    """
     try:
         nlp = spacy.load("en_core_web_sm", exclude=["ner", "textcat"])
-        logger.info("spaCy en_core_web_sm loaded (optimized).")
+        logger.info("spaCy loaded")
         return nlp
     except Exception as e:
         logger.error("spaCy model not available: %s", e)
-        raise RuntimeError("Please run: python -m spacy download en_core_web_sm") from e
+        raise
 
-NLP = _load_spacy_model()
 
-# Small list for fallback human detection
-_HUMAN_HINTS = [
-    "man", "woman", "person", "elder", "master", "teacher", "warrior",
-    "monk", "martial artist", "samurai", "fighter", "grandmaster",
-    "portrait", "face", "head", "actor", "reader"
-]
+# create global nlp if possible
+_nlp = None
+if _SPACY_AVAILABLE:
+    try:
+        _nlp = _load_spacy_model()
+    except Exception:
+        _nlp = None
 
-def _first_human_hint(text: str) -> Optional[str]:
-    t = text.lower()
-    for hint in _HUMAN_HINTS:
-        if hint in t:
-            # return a small phrase around hint if possible
-            # basic regex to capture up to 3 words before/after
-            m = re.search(r"((?:\w+\s){0,3}"+re.escape(hint)+r"(?:\s\w+){0,3})", text, flags=re.I)
-            if m:
-                return m.group(1).strip()
-            return hint
+
+def _simple_subject_heuristic(text: str) -> Optional[str]:
+    """
+    Very small fallback heuristic: return first continuous chunk of words before a verb.
+    Not perfect but prevents crashes.
+    """
+    # split at common verb tokens to isolate likely subject phrase
+    verbs = r"\b(is|are|was|were|finds|find|finds|find|picks|picks up|takes|holds|walks|runs|looks|sees|discovers|opens|closes|turns)\b"
+    parts = re.split(verbs, text, flags=re.IGNORECASE)
+    if parts:
+        candidate = parts[0].strip()
+        # clamp length
+        if len(candidate) > 0:
+            # keep up to 6 words for subject candidate
+            words = candidate.split()
+            return " ".join(words[:6])
     return None
 
-def semantic_parser(prompt: str) -> Dict[str, Optional[str]]:
+
+def semantic_parser(text: str) -> Dict[str, Any]:
     """
-    spaCy-based dependency-first semantic parsing that extracts subject/action/object/environment.
-    Uses robust fallbacks and returns dict keys: subject, action, object, environment.
+    Returns a small semantic dict: subject, action, object, environment (may be None).
+    Uses spaCy if available, otherwise uses a small heuristic.
     """
-    doc = NLP(prompt)
+    out = {"subject": None, "action": None, "object": None, "environment": None}
+    if not text:
+        return out
 
-    def get_chunk_for_token(token):
-        if token is None: return None
-        for chunk in doc.noun_chunks:
-            if token.i >= chunk.start and token.i < chunk.end:
-                return chunk.text
-        return token.text
+    if _nlp:
+        try:
+            doc = _nlp(text)
+            # noun_chunks may be a generator in some spaCy versions, so convert to list
+            chunks = list(doc.noun_chunks)
+            if chunks:
+                subject_tok = chunks[0].root
+                out["subject"] = " ".join([tok.text for tok in subject_tok.subtree])
+            # simple action detection: first verb
+            verb = next((tok for tok in doc if tok.pos_ == "VERB"), None)
+            if verb:
+                out["action"] = verb.lemma_
+            # object: look for direct object (dobj) dependency if present
+            dobj = next((tok for tok in doc if tok.dep_ == "dobj"), None)
+            if dobj:
+                out["object"] = " ".join([t.text for t in dobj.subtree])
+            # environment extraction: look for prepositional objects (pobj) after 'in', 'on', 'at'
+            for tok in doc:
+                if tok.text.lower() in ("in", "on", "at", "inside", "outside"):
+                    # find the pobj child
+                    pobj = next((child for child in tok.children if child.dep_ == "pobj"), None)
+                    if pobj:
+                        out["environment"] = " ".join([t.text for t in pobj.subtree])
+                        break
+        except Exception as e:
+            logger.warning("spaCy parsing failed, falling back to heuristics: %s", e)
+            out["subject"] = _simple_subject_heuristic(text)
+    else:
+        # fallback heuristic
+        out["subject"] = _simple_subject_heuristic(text)
+        # action: first verb-like token by regex
+        m = re.search(r"\b(find|finds|takes|holds|walks|runs|looks|sees|discovers|opens|closes|turns|moves)\b", text, flags=re.IGNORECASE)
+        if m:
+            out["action"] = m.group(0).lower()
 
-    subject_tok, action_tok, object_tok, env_tok = None, None, None, None
+    # normalize empty strings to None
+    for k in out:
+        if isinstance(out[k], str):
+            out[k] = out[k].strip() or None
 
-    # 1. Find ROOT or first verb
-    for token in doc:
-        if token.dep_ == "ROOT" and token.pos_ == "VERB":
-            action_tok = token
-            break
-    if action_tok is None:
-        for token in doc:
-            if token.pos_ == "VERB":
-                action_tok = token
-                break
-
-    # 2. Collect dependents of the main verb
-    if action_tok:
-        for child in action_tok.children:
-            if child.dep_ in {"nsubj", "nsubj:pass"}:
-                subject_tok = child
-            if child.dep_ in {"dobj", "obj", "pobj"}:
-                object_tok = child
-            if child.dep_ == "prep":
-                # environment candidates
-                if child.text.lower() in ["in", "at", "on", "inside", "near", "under", "within", "amid", "among"]:
-                    for p_child in child.children:
-                        if p_child.dep_ == "pobj":
-                            env_tok = p_child
-                        # sometimes environment appears as noun_chunk after prep
-    # 3. Fallbacks
-    if subject_tok is None:
-        for token in doc:
-            if token.dep_ == "nsubj":
-                subject_tok = token
-                break
-    if subject_tok is None:
-        # fallback to first noun chunk
-        for chunk in doc.noun_chunks:
-            subject_tok = chunk.root
-            break
-
-    if env_tok is None:
-        for token in doc:
-            if token.dep_ == "pobj" and token.head.text.lower() in {"in", "at", "on", "inside", "near"}:
-                env_tok = token; break
-
-    # 4. Convert tokens to text
-    subject = get_chunk_for_token(subject_tok)
-    action = action_tok.lemma_ if action_tok else None
-    obj = get_chunk_for_token(object_tok)
-    environment = get_chunk_for_token(env_tok)
-
-    # 5. Post processing & safety
-    if obj and environment and obj == environment:
-        obj = None
-
-    # If subject missing or subject is too generic and prompt contains a human hint, anchor it
-    if not subject or subject.strip().lower() in {"photorealistic portrait", "portrait", "photorealistic"}:
-        hint = _first_human_hint(prompt)
-        if hint:
-            subject = hint
-
-    parsed = {"subject": subject, "action": action, "object": obj, "environment": environment}
-    logger.info(f"semantic_parser -> {parsed}")
-    return parsed
-
-
-# Optional helper to slightly reweight parts for safety (callers can use if desired)
-def reweight_parts(parts: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
-    """
-    Small, conservative reweighting:
-    - If subject contains 'portrait' but also a human hint, prefer 'person in context' style to avoid ECU.
-    - This function does NOT overwrite rich subjects, it only avoids degenerate 'portrait' alone.
-    """
-    subj = parts.get("subject") or ""
-    if subj and "portrait" in subj.lower() and not any(w in subj.lower() for w in ["man","woman","martial","samurai","artist","master"]):
-        # expand to contextualized subject
-        parts["subject"] = (subj + " in full context").strip()
-    return parts
+    return out
