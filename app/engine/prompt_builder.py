@@ -15,6 +15,13 @@ def _looks_like_style_already(text: str) -> bool:
             return True
     return False
 
+def _trim_prompt(prompt: str, max_words: int = 60) -> str:
+    words = prompt.split()
+    if len(words) > max_words:
+        logger.warning("Prompt trimmed from %d -> %d words", len(words), max_words)
+        return " ".join(words[:max_words])
+    return prompt
+
 
 def build_semantic_prompt(
     raw_prompt: str,
@@ -75,6 +82,7 @@ def build_semantic_prompt(
         narrative.append(BASE_QUALITY_PROMPT)
 
     pos_prompt = ", ".join([p for p in narrative if p])
+    pos_prompt = _trim_prompt(pos_prompt)
 
     negative_parts = [BASE_NEGATIVE_PROMPT]
     if user_negative_prompt:
