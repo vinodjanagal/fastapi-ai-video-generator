@@ -89,11 +89,15 @@ class PhoenixDirector:
         except Exception as e:
             logger.error(f"Stitch Error: {e}")
 
+
     def run(self, prompt):
-        uid = uuid.uuid4().hex[:6]
-        self.generate_character(prompt, uid)
-        self.generate_scenes(prompt, uid)
-        self.stitch(self.generate_scenes(prompt, uid), uid)
+            uid = uuid.uuid4().hex[:6]
+            # 1. Establish Identity
+            self.generate_character(prompt, uid)
+            # 2. Render Scenes (Once)
+            scene_dirs = self.generate_scenes(prompt, uid)
+            # 3. Stitch
+            self.stitch(scene_dirs, uid)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

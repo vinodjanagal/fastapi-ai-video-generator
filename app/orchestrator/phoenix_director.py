@@ -89,8 +89,8 @@ class PhoenixDirector:
     def run(self, prompt):
         uid = uuid.uuid4().hex[:6]
         self.generate_character(prompt, uid)
-        self.generate_scenes(prompt, uid)
-        self.stitch(self.generate_scenes(prompt, uid), uid)
+        scene_dirs = self.generate_scenes(prompt, uid)
+        self.stitch(scene_dirs, uid)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
