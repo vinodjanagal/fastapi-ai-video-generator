@@ -1,0 +1,150 @@
+ Volume in drive D is Data
+ Volume Serial Number is E468-AD9A
+
+ Directory of D:\revision\zeroscope_cache
+
+22-11-2025  11:44    <DIR>          .
+22-11-2025  11:44    <DIR>          ..
+22-11-2025  11:37    <DIR>          .cache
+22-11-2025  11:37             1,519 .gitattributes
+22-11-2025  11:37               384 model_index.json
+22-11-2025  11:37             3,233 README.md
+22-11-2025  11:37    <DIR>          scheduler
+22-11-2025  11:37    <DIR>          text_encoder
+22-11-2025  11:37    <DIR>          tokenizer
+22-11-2025  11:37    <DIR>          unet
+22-11-2025  11:37    <DIR>          vae
+22-11-2025  11:44    <DIR>          zs2_576w
+               3 File(s)          5,136 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37    <DIR>          huggingface
+               0 File(s)              0 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37                 1 .gitignore
+22-11-2025  11:37    <DIR>          download
+               1 File(s)              1 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface\download
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               104 .gitattributes.metadata
+22-11-2025  11:37               103 model_index.json.metadata
+22-11-2025  11:37               104 README.md.metadata
+22-11-2025  11:37    <DIR>          scheduler
+22-11-2025  11:37    <DIR>          text_encoder
+22-11-2025  11:37    <DIR>          tokenizer
+22-11-2025  11:37    <DIR>          unet
+22-11-2025  11:37    <DIR>          vae
+22-11-2025  11:44    <DIR>          zs2_576w
+               3 File(s)            311 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface\download\scheduler
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               104 scheduler_config.json.metadata
+               1 File(s)            104 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface\download\text_encoder
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               104 config.json.metadata
+22-11-2025  11:37               127 pytorch_model.bin.metadata
+               2 File(s)            231 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface\download\tokenizer
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               104 merges.txt.metadata
+22-11-2025  11:37               103 special_tokens_map.json.metadata
+22-11-2025  11:37               104 tokenizer_config.json.metadata
+22-11-2025  11:37               104 vocab.json.metadata
+               4 File(s)            415 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface\download\unet
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               103 config.json.metadata
+22-11-2025  11:37               128 diffusion_pytorch_model.bin.metadata
+               2 File(s)            231 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface\download\vae
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               104 config.json.metadata
+22-11-2025  11:37               128 diffusion_pytorch_model.bin.metadata
+               2 File(s)            232 bytes
+
+ Directory of D:\revision\zeroscope_cache\.cache\huggingface\download\zs2_576w
+
+22-11-2025  11:44    <DIR>          .
+22-11-2025  11:44    <DIR>          ..
+22-11-2025  11:43               128 open_clip_pytorch_model.bin.metadata
+22-11-2025  11:44               128 text2video_pytorch_model.pth.metadata
+               2 File(s)            256 bytes
+
+ Directory of D:\revision\zeroscope_cache\scheduler
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               465 scheduler_config.json
+               1 File(s)            465 bytes
+
+ Directory of D:\revision\zeroscope_cache\text_encoder
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               609 config.json
+22-11-2025  11:37       680,904,225 pytorch_model.bin
+               2 File(s)    680,904,834 bytes
+
+ Directory of D:\revision\zeroscope_cache\tokenizer
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37           524,619 merges.txt
+22-11-2025  11:37               460 special_tokens_map.json
+22-11-2025  11:37               737 tokenizer_config.json
+22-11-2025  11:37         1,059,962 vocab.json
+               4 File(s)      1,585,778 bytes
+
+ Directory of D:\revision\zeroscope_cache\unet
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               727 config.json
+22-11-2025  11:37     2,823,110,385 diffusion_pytorch_model.bin
+               2 File(s)  2,823,111,112 bytes
+
+ Directory of D:\revision\zeroscope_cache\vae
+
+22-11-2025  11:37    <DIR>          .
+22-11-2025  11:37    <DIR>          ..
+22-11-2025  11:37               636 config.json
+22-11-2025  11:37       167,407,857 diffusion_pytorch_model.bin
+               2 File(s)    167,408,493 bytes
+
+ Directory of D:\revision\zeroscope_cache\zs2_576w
+
+22-11-2025  11:44    <DIR>          .
+22-11-2025  11:44    <DIR>          ..
+22-11-2025  11:43     1,972,448,549 open_clip_pytorch_model.bin
+22-11-2025  11:44     2,822,972,283 text2video_pytorch_model.pth
+               2 File(s)  4,795,420,832 bytes
+
+     Total Files Listed:
+              33 File(s)  8,468,438,431 bytes
+              47 Dir(s)  58,981,363,712 bytes free

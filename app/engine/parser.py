@@ -36,71 +36,249 @@ if _SPACY_AVAILABLE:
         _nlp = None
 
 
+# -------------------------------------------------------------------
+# Helper cleaning functions
+# -------------------------------------------------------------------
+
+_CAMERA_PATTERNS = [
+    r"^The camera\s+\w+\s+across[^,.]*[,.]\s*",   # "The camera pans across ..."
+    r"^Camera\s+\w+\s+across[^,.]*[,.]\s*",       # "Camera glides across ..."
+]
+
+
+def _clean_semantic_string(text: str) -> str:
+    """
+    Strip obvious narrative / camera language and tidy whitespace.
+    This keeps only the core scene content for subject/action/object.
+    """
+    if not text:
+        return ""
+
+    cleaned = text
+
+    # Remove leading camera-narration phrases like
+    # "The camera pans across the library, ..."
+    for pat in _CAMERA_PATTERNS:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+
+    # Collapse multiple spaces and stray spaces before punctuation
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.!?])", r"\1", cleaned)
+
+    return cleaned.strip()
+
+
+def _truncate_at_first_comma(text: str) -> str:
+    """
+    For subjects we don't want huge clauses. Keep text up to first comma.
+    """
+    if not text:
+        return ""
+    parts = text.split(",", 1)
+    return parts[0].strip()
+
+
 def _simple_subject_heuristic(text: str) -> Optional[str]:
     """
-    Very small fallback heuristic: return first continuous chunk of words before a verb.
-    Not perfect but prevents crashes.
+    Very small fallback heuristic: return first continuous chunk of words
+    before a verb, after narrative cleaning. Not perfect but prevents crashes.
     """
+    text = _clean_semantic_string(text)
+    if not text:
+        return None
+
     # split at common verb tokens to isolate likely subject phrase
-    verbs = r"\b(is|are|was|were|finds|find|finds|find|picks|picks up|takes|holds|walks|runs|looks|sees|discovers|opens|closes|turns)\b"
+    verbs = (
+        r"\b("
+        r"is|are|was|were|"
+        r"find|finds|"
+        r"take|takes|"
+        r"pick|picks|"
+        r"hold|holds|"
+        r"walk|walks|"
+        r"run|runs|"
+        r"look|looks|"
+        r"see|sees|"
+        r"discover|discovers|"
+        r"open|opens|"
+        r"close|closes|"
+        r"turn|turns|"
+        r"move|moves|"
+        r"reach|reaches|"
+        r"approach|approaches"
+        r")\b"
+    )
     parts = re.split(verbs, text, flags=re.IGNORECASE)
     if parts:
         candidate = parts[0].strip()
-        # clamp length
-        if len(candidate) > 0:
+        if candidate:
+            candidate = _truncate_at_first_comma(candidate)
             # keep up to 6 words for subject candidate
             words = candidate.split()
             return " ".join(words[:6])
     return None
 
 
-def semantic_parser(text: str) -> Dict[str, Any]:
+def _simple_action_heuristic(text: str) -> Optional[str]:
+    """
+    Small regex-based verb picker for fallback when spaCy is not available.
+    """
+    text = _clean_semantic_string(text)
+    if not text:
+        return None
+
+    actions = (
+        r"\b("
+        r"find|finds|"
+        r"take|takes|"
+        r"pick|picks|"
+        r"hold|holds|"
+        r"walk|walks|"
+        r"run|runs|"
+        r"look|looks|"
+        r"see|sees|"
+        r"discover|discovers|"
+        r"open|opens|"
+        r"close|closes|"
+        r"turn|turns|"
+        r"move|moves|"
+        r"reach|reaches|"
+        r"approach|approaches|"
+        r"lift|lifts|"
+        r"touch|touches"
+        r")\b"
+    )
+    m = re.search(actions, text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _simple_environment_heuristic(text: str) -> Optional[str]:
+    """
+    Fallback env extractor: look for phrases starting with in/on/at/inside/outside.
+    """
+    text = _clean_semantic_string(text)
+    if not text:
+        return None
+
+    m = re.search(
+        r"\b(in|on|at|inside|outside)\b\s+([^.,]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        phrase = m.group(0)
+        return phrase.strip()
+    return None
+
+
+# -------------------------------------------------------------------
+# Main semantic parser (JSON-first, as per Option A)
+# -------------------------------------------------------------------
+def semantic_parser(
+    text: str,
+    composition: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Returns a small semantic dict: subject, action, object, environment (may be None).
-    Uses spaCy if available, otherwise uses a small heuristic.
-    """
-    out = {"subject": None, "action": None, "object": None, "environment": None}
-    if not text:
-        return out
 
+    JSON-FIRST (Option A):
+    - If composition["environment"] exists, it is used as the primary environment.
+    - Text is still parsed for subject/action/object, and may fill env only if JSON has none.
+    """
+    out: Dict[str, Optional[str]] = {
+        "subject": None,
+        "action": None,
+        "object": None,
+        "environment": None,
+    }
+
+    # 1) JSON-FIRST: use storyboard composition.environment if present.
+    if composition:
+        env = composition.get("environment")
+        if isinstance(env, str) and env.strip():
+            out["environment"] = env.strip()
+
+    # If there is no text at all, return what we got from JSON.
+    if not text:
+        # normalize empties to None
+        for k in out:
+            if isinstance(out[k], str):
+                out[k] = out[k].strip() or None
+        return out  # type: ignore[return-value]
+
+    cleaned_text = _clean_semantic_string(text)
+
+    if not cleaned_text:
+        # Still normalize and bail early
+        for k in out:
+            if isinstance(out[k], str):
+                out[k] = out[k].strip() or None
+        return out  # type: ignore[return-value]
+
+    # 2) spaCy path (preferred)
     if _nlp:
         try:
-            doc = _nlp(text)
-            # noun_chunks may be a generator in some spaCy versions, so convert to list
+            doc = _nlp(cleaned_text)
+
+            # SUBJECT: first noun chunk that is not about the camera.
             chunks = list(doc.noun_chunks)
-            if chunks:
-                subject_tok = chunks[0].root
-                out["subject"] = " ".join([tok.text for tok in subject_tok.subtree])
-            # simple action detection: first verb
-            verb = next((tok for tok in doc if tok.pos_ == "VERB"), None)
-            if verb:
-                out["action"] = verb.lemma_
-            # object: look for direct object (dobj) dependency if present
+            for chunk in chunks:
+                # Skip camera-describing chunks
+                root_lemma = chunk.root.lemma_.lower()
+                if root_lemma in {"camera"}:
+                    continue
+                subj_text = " ".join(tok.text for tok in chunk)
+                subj_text = _truncate_at_first_comma(subj_text)
+                out["subject"] = subj_text
+                break
+
+            # ACTION: first "real" verb, avoiding camera verbs like "pan", "glide"
+            for tok in doc:
+                if tok.pos_ == "VERB":
+                    lemma = tok.lemma_.lower()
+                    if lemma in {"pan", "glide", "sweep"}:
+                        continue
+                    out["action"] = lemma
+                    break
+
+            # OBJECT: direct object if present
             dobj = next((tok for tok in doc if tok.dep_ == "dobj"), None)
             if dobj:
-                out["object"] = " ".join([t.text for t in dobj.subtree])
-            # environment extraction: look for prepositional objects (pobj) after 'in', 'on', 'at'
-            for tok in doc:
-                if tok.text.lower() in ("in", "on", "at", "inside", "outside"):
-                    # find the pobj child
-                    pobj = next((child for child in tok.children if child.dep_ == "pobj"), None)
-                    if pobj:
-                        out["environment"] = " ".join([t.text for t in pobj.subtree])
-                        break
+                out["object"] = " ".join(t.text for t in dobj.subtree)
+
+            # ENVIRONMENT: only if JSON did NOT already give us one
+            if out["environment"] is None:
+                for tok in doc:
+                    if tok.text.lower() in ("in", "on", "at", "inside", "outside"):
+                        pobj = next(
+                            (child for child in tok.children if child.dep_ == "pobj"),
+                            None,
+                        )
+                        if pobj:
+                            out["environment"] = " ".join(t.text for t in pobj.subtree)
+                            break
+
         except Exception as e:
             logger.warning("spaCy parsing failed, falling back to heuristics: %s", e)
-            out["subject"] = _simple_subject_heuristic(text)
-    else:
-        # fallback heuristic
-        out["subject"] = _simple_subject_heuristic(text)
-        # action: first verb-like token by regex
-        m = re.search(r"\b(find|finds|takes|holds|walks|runs|looks|sees|discovers|opens|closes|turns|moves)\b", text, flags=re.IGNORECASE)
-        if m:
-            out["action"] = m.group(0).lower()
+            out["subject"] = _simple_subject_heuristic(cleaned_text)
+            if out["action"] is None:
+                out["action"] = _simple_action_heuristic(cleaned_text)
+            if out["environment"] is None:
+                out["environment"] = _simple_environment_heuristic(cleaned_text)
 
-    # normalize empty strings to None
+    else:
+        # 3) No spaCy: pure heuristic path
+        out["subject"] = _simple_subject_heuristic(cleaned_text)
+        out["action"] = _simple_action_heuristic(cleaned_text)
+        if out["environment"] is None:
+            out["environment"] = _simple_environment_heuristic(cleaned_text)
+
+    # 4) Normalize empty strings to None
     for k in out:
         if isinstance(out[k], str):
             out[k] = out[k].strip() or None
 
-    return out
+    logger.info(f"semantic_parser: text='{text}' -> {out}")
+    return out  # type: ignore[return-value]
